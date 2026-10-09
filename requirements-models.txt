@@ -1,0 +1,23 @@
+# Task 3: speech (Whisper) and on-screen text (PaddleOCR). Optional: the test
+# suite mocks both and never needs these.
+#
+# Install into a SEPARATE venv, not .venv: PaddleOCR pins
+# opencv-contrib-python==4.10.0.84 and numpy<2.4, which clash with the main
+# environment's opencv-python-headless 5.x / numpy 2.4 (both OpenCV builds
+# install the same cv2 package). Run run_pipeline.py from .venv first; the
+# speech/OCR venv then only reads the cached features.
+#   uv venv --python 3.11 .venv-models
+#   uv pip install --python .venv-models/bin/python -r requirements-models.txt
+#
+# Models are not downloaded at install time; run scripts/run_speech_ocr.py
+# once with --download-models (Whisper "small" ~0.5 GB, PP-OCRv5 mobile ~20 MB).
+
+numpy>=1.26,<2.4
+pytest>=8
+faster-whisper>=1.1          # CTranslate2 Whisper; CPU int8 on Apple Silicon, CUDA float16 on Kaggle
+paddleocr>=3.0,<3.8          # PP-OCRv5 pipeline; brings paddlex and opencv-contrib-python (provides cv2)
+paddlepaddle>=3.0            # CPU build (~100 MB); on a CUDA machine install paddlepaddle-gpu instead
+librosa>=0.11,<0.12          # librosa audio features (librosa.json); pulls scipy, numba, soundfile
+google-genai>=2.29,<3        # Gemini interpretation (gemini.json); only used with --gemini remote
+torch==2.14.1                # SigLIP 2 (--siglip); MPS on Apple Silicon, ~555 MB installed
+transformers==5.19.0         # SigLIP 2 model/processor; weights (~1.5 GB) fetched on first --siglip --download-models

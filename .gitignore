@@ -1,0 +1,67 @@
+# Environments and caches
+.venv/
+.venv-*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+hf_token*
+credentials*.json
+
+# Hackathon-provided company dataset: never commit or redistribute
+01-Hookline/
+*.zip
+
+# Media and data: keep READMEs and manifests only
+data/raw/*
+!data/raw/README.md
+!data/raw/manifest.csv
+data/sample/*
+!data/sample/manifest.csv
+data/snapugc/*
+!data/snapugc/README.md
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.webm
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.part
+
+# Models and large artifacts
+artifacts/*
+!artifacts/.gitkeep
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.tar
+*.npy
+*.npz
+*.pdiparams
+*.pdiparams.info
+*.pdmodel
+official_models/
+
+# Generated reports (hand-written docs in reports/ stay tracked)
+reports/*_report.md
+reports/*_report.json

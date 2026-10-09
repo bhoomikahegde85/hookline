@@ -1,0 +1,9 @@
+# FFmpeg/FFprobe must be installed separately (system package).
+pytest>=8
+
+# Phase 1, Task 2: preprocessing + timestamped low-level features
+numpy>=1.26
+opencv-python-headless>=4.9
+
+# Tests for the librosa stage run in both venvs (they are skipped if librosa is missing).
+librosa>=0.11,<0.12
