@@ -303,3 +303,71 @@ def test_faster_whisper_missing_package(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "faster_whisper", None)
     with pytest.raises(BackendUnavailable, match="not installed"):
         FasterWhisperTranscriber(CFG)
+
+
+# ------------------------------------------------------------- confidence flags and speech_result
+
+def flagged(lp=-0.87, nsp=0.9, probs=(0.31, 0.54, 0.56)):
+    s = seg(6.5, 8.1, [(6.5, 6.7, "अपने"), (6.7, 7.4, "काई"), (7.4, 8.1, "गया")], lp=lp, nsp=nsp)
+    for w, p in zip(s["words"], probs):
+        w["probability"] = p
+    return s
+
+
+def test_music_hallucination_pattern_is_uncertain_but_kept(tmp_path) -> None:
+    # The FL004 pattern: decoder confident enough to keep text, but Whisper's own no-speech
+    # probability is high, the words are unsure and the language guess is weak.
+    result = {"language": "hi", "language_probability": 0.23, "segments": [flagged()]}
+    art = extract_speech(ctx_for(tmp_path, tone(8.5), duration=8.5), CFG, LazyBackend(lambda: FakeTranscriber(result)))
+    (s,) = art["segments"]
+    assert s["flags"] == ["high_no_speech_prob", "low_word_probability"]
+    assert art["status"] == "uncertain" and art["measured"] and art["speech_detected"] is None
+    assert art["speech_result"] == "uncertain_speech" and art["flags"] == ["low_language_confidence"]
+    assert [w["word"] for w in s["words"]] == ["अपने", "काई", "गया"] and s["words"][0]["start_s"] == 6.5  # nothing deleted
+    assert any("wrong script or hallucinated" in w for w in art["warnings"])
+
+
+def test_each_flag_alone() -> None:
+    from hookline.speech import _flags
+    assert _flags(flagged(lp=-0.2, nsp=0.05, probs=(0.9, 0.9, 0.9)), CFG) == []
+    assert _flags(flagged(lp=-0.2, nsp=0.9, probs=(0.9, 0.9, 0.9)), CFG) == ["high_no_speech_prob"]
+    assert _flags(flagged(lp=-1.5, nsp=0.9, probs=(0.9, 0.9, 0.9)), CFG) == ["low_confidence", "possible_non_speech"]
+    assert _flags(flagged(lp=-0.2, nsp=0.05, probs=(0.3, 0.4, 0.5)), CFG) == ["low_word_probability"]
+    assert _flags(flagged(lp=-0.2, nsp=0.05, probs=(None, None, None)), CFG) == []  # no probabilities: no claim
+
+
+def test_speech_result_states(tmp_path) -> None:
+    def result_for(**kw):
+        c = ctx_for(tmp_path, kw.pop("samples", tone(4.0)), **kw.pop("ctx", {}))
+        return extract_speech(c, CFG, kw.pop("backend"))
+
+    good = {"language": "hi", "language_probability": 0.97, "segments": [flagged(lp=-0.2, nsp=0.05, probs=(0.9, 0.9, 0.9))]}
+    assert result_for(backend=LazyBackend(lambda: FakeTranscriber(good)))["speech_result"] == "speech"
+    empty = {"language": "en", "language_probability": 0.4, "segments": []}
+    none = result_for(backend=LazyBackend(lambda: FakeTranscriber(empty)))
+    assert (none["speech_result"], none["speech_detected"], none["flags"]) == ("no_speech", False, [])  # no words: no language flag
+    silent = result_for(samples=np.zeros(16000 * 4), backend=must_not_load())
+    assert silent["speech_result"] == "no_speech" and silent["method"] == "skipped_silent_audio"
+    crash = result_for(backend=LazyBackend(lambda: FakeTranscriber(exc=RuntimeError("boom"))))
+    assert (crash["speech_result"], crash["speech_detected"], crash["status"]) == ("failed", None, "failed")
+    missing_model = result_for(backend=LazyBackend(lambda: (_ for _ in ()).throw(BackendUnavailable("not cached"))))
+    assert missing_model["speech_result"] == "failed"
+    absent = result_for(samples=None, ctx={"audio_stream": "absent"}, backend=must_not_load())
+    assert absent["speech_result"] == "absent"
+    unknown = result_for(samples=None, ctx={"audio_stream": "uncertain"}, backend=must_not_load())
+    assert unknown["speech_result"] == "unknown" and unknown["speech_detected"] is None
+
+
+def test_language_flag_only_for_detected_language_and_does_not_hide_speech(tmp_path) -> None:
+    confident_words = {"language": "hi", "language_probability": 0.3,
+                       "segments": [flagged(lp=-0.2, nsp=0.05, probs=(0.95, 0.9, 0.92))]}
+    art = extract_speech(ctx_for(tmp_path, tone(8.5), duration=8.5), CFG, LazyBackend(lambda: FakeTranscriber(confident_words)))
+    assert art["speech_result"] == "speech" and art["flags"] == ["low_language_confidence"] and art["status"] == "available"
+    forced = extract_speech(ctx_for(tmp_path, tone(8.5), duration=8.5), replace(CFG, language="hi"),
+                            LazyBackend(lambda: FakeTranscriber(confident_words)))
+    assert forced["flags"] == []
+
+
+def test_flag_thresholds_are_part_of_the_cache_key(tmp_path) -> None:
+    c = ctx_for(tmp_path, tone(1.0))
+    assert speech_key(c, replace(CFG, low_word_probability=0.4)) != speech_key(c, CFG)

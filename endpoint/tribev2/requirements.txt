@@ -1,0 +1,5 @@
+# Installed by Hugging Face Inference Endpoints at startup, next to handler.py.
+# TRIBE v2 at the commit this handler was written against (pins torch>=2.5.1,<2.7, numpy==2.2.6, neuralset==0.0.2).
+tribev2 @ git+https://github.com/facebookresearch/tribev2@af58661791a351a448a489042a28f6c37e1c14b7
+# tribev2 transcribes speech by running `uvx whisperx ...`; the uv package provides the uvx command.
+uv

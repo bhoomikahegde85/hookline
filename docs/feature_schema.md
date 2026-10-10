@@ -113,7 +113,10 @@ The first frame has empty `motion`, `hist_change` and `struct_change`.
 speech, on-screen text, semantic visual; speech and text are written by the
 Task 3 stage to their own files, so this report and its cache stay unchanged), `probe` (FFprobe facts),
 `preprocess` (cache key, proxy/WAV paths, `timestamp_map`), `extractor`
-(versions, `feature_key`, full config), `scene_cut_times`, `warnings`,
+(Hookline/preprocess/feature versions, `feature_key`, full config, `dependencies` =
+OpenCV/NumPy/FFmpeg versions that computed the features, `preprocess_ffmpeg` = the FFmpeg that
+made the proxy/WAV (`null` for caches older than this field), `runtime` = Python version and
+executable), `scene_cut_times`, `warnings`,
 `errors`, `opening` (below), `segments` (same fields as the CSV plus a
 `feature_status` map), `outputs`.
 
@@ -136,9 +139,20 @@ These describe the opening; they are not engagement predictions.
 
 ## Run-level files (`artifacts/features/`)
 
-- `run_summary.json`: inputs, config, counts (`ok` / `partial` / `failed`), and one record per video.
-- `segments_all.csv`: every segment row from the run.
-- `first5s_summary.csv`: one row per processed video.
+Rebuilt after every run from **all** per-video folders in the artifacts root, sorted by
+`video_id`. Re-running one video therefore updates only that video's rows; other videos stay,
+unchanged and without duplicates. A per-video file whose header differs from the current schema
+is left out, not padded with blanks. Its video id is listed in `excluded_stale_schema` and in
+the log; re-run that video.
+
+- `run_summary.json`: `counts` and `videos` cover every video in the root. A video's record is
+  replaced when it's re-run, and rebuilt from `report.json` (`record_source`) if no earlier
+  summary had it. `last_run` holds this invocation's inputs, config, video ids and counts (the
+  exit code uses these). Also holds `feature_environment` and `excluded_stale_schema`.
+- `segments_all.csv`: every video's `segments.csv` rows.
+- `first5s_summary.csv`: one row per video with a `report.json`.
+- `feature_env.json`: the OpenCV/NumPy/FFmpeg versions, Python version and executable that built
+  this root's features (see [Caching](#caching)).
 
 CSV is the only tabular format written (no Parquet dependency); load with
 `pandas.read_csv(..., keep_default_na=True)` so empty cells become NaN.
@@ -148,16 +162,33 @@ CSV is the only tabular format written (no Parquet dependency); load with
 `artifacts/cache/<video_id>/<key16>/` holds `proxy.mp4`, `audio.wav` and
 `preprocess.json`. The key hashes the source bytes plus the preprocessing
 fields of the config (`proxy_fps`, `proxy_short_side`, `audio_sample_rate`,
-`preprocess_version`). Features are recomputed when any config field or
-`feature_version` changes (`extractor.feature_key`). Changing the source file
-changes the key; originals are never written.
+`preprocess_version`). A cached proxy/WAV is also rebuilt when the FFmpeg that made it
+(`preprocess.json -> ffmpeg_version`) differs from the installed one. Caches written before this
+field existed are reused and reported as `preprocess_ffmpeg: null`.
+
+Features are recomputed, from the cached proxy/WAV, when any config field, `feature_version`, or
+the OpenCV, NumPy or FFmpeg version changes (`extractor.feature_key` hashes the preprocessing
+key, the config and those versions). Changing the source file changes the key; originals are
+never written.
+
+Environment rules:
+- Task 2 features are computed only by `scripts/run_pipeline.py` in the feature environment
+  (`.venv`).
+- It exits with code 3 when run with this project's `.venv-models` (whose PaddleOCR pins an older
+  OpenCV/NumPy), or when the root's `feature_env.json` names different library versions. In the
+  second case it prints the recorded interpreter; `--new-feature-env` deliberately rebuilds the
+  root's features in the current environment.
+- `run_speech_ocr.py` never computes Task 2 features. It reuses a video's `report.json` only if
+  the source hash, config, feature/preprocess versions match and dependency provenance is
+  present. Otherwise that video is `failed` with the exact `run_pipeline.py` command to run.
 
 ---
 
 ## Speech and on-screen text (Task 3)
 
 `scripts/run_speech_ocr.py` (`hookline.multimodal`) reads each video's cached
-Task 2 report (computing it first if missing) and never re-runs or changes
+Task 2 report (which must exist: build it first with `.venv/bin/python scripts/run_pipeline.py`)
+and never re-runs or changes
 preprocessing or visual/audio extraction. Speech uses the cached mono 16 kHz
 WAV; OCR samples frames from the original. Versions: `speech_version` 1,
 `ocr_version` 2 (`src/hookline/config.py`). The same five statuses apply.
@@ -201,7 +232,7 @@ pass, so mixed-script captions need a second pass with another language.
 | `available` | transcribed; or the audio is below -50 dBFS throughout (model skipped, `method: skipped_silent_audio`) | OCR ran on at least one sampled frame |
 | `absent` | the file has no audio stream | the file has no video stream |
 | `failed` | audio exists but is undecodable, cached WAV missing, model unavailable, or transcription raised | video undecodable, frame sampling failed, model unavailable, or OCR raised on every frame |
-| `uncertain` | stream presence unknown (inspection failed), or every transcribed segment is flagged low-confidence | stream presence unknown |
+| `uncertain` | stream presence unknown (inspection failed), or every transcribed segment is flagged | stream presence unknown |
 
 `speech_detected` / `text_detected` are `true`/`false` only when the stage
 measured the file, and `null` otherwise. A failure, a missing stream or a
@@ -213,7 +244,7 @@ of low confidence).
 
 `schema_version`, `speech_version`, `generated_at`, `video_id`, `source_path`,
 `source_sha256`, `cache_key`, `status`, `measured`, `speech_detected`,
-`method` (`asr` | `skipped_silent_audio`), `reason`, `language` and
+`speech_result`, `flags` (file level), `method` (`asr` | `skipped_silent_audio`), `reason`, `language` and
 `language_probability` (detected per video unless `--language` is given; the
 task is always `transcribe`, never translate), `word_timestamps`, `model`
 (backend, version, model, revision, compute type, device), `config`,
@@ -225,8 +256,24 @@ task is always `transcribe`, never translate), `word_timestamps`, `model`
 | --- | --- | --- |
 | `id`, `start_s`, `end_s`, `text` | s | Whisper segment on the project timeline |
 | `avg_logprob`, `no_speech_prob`, `compression_ratio` | | Whisper's own confidence signals |
-| `flags` | list | `low_confidence` (avg_logprob < -1.0), `possible_non_speech` (also no_speech_prob > 0.6), `repetitive` (compression_ratio > 2.4): typical of hallucinations on music or noise |
+| `flags` | list | `low_confidence` (avg_logprob < −1.0); `possible_non_speech` (low_confidence and no_speech_prob > 0.6); `high_no_speech_prob` (no_speech_prob > 0.6 although avg_logprob ≥ −1.0); `low_word_probability` (mean word probability < 0.5); `repetitive` (compression_ratio > 2.4). These are typical of hallucinations on music or noise. Flagged segments and their words are kept, never deleted |
 | `words[]` | | `start_s`, `end_s`, `word`, `probability` (0–1); `null` if the backend gave no word timestamps |
+
+`speech_result` (speech version 2) separates the outcomes:
+
+| `speech_result` | meaning |
+| --- | --- |
+| `speech` | at least one unflagged segment (`speech_detected: true`) |
+| `no_speech` | measured, nothing transcribed, or audio below −50 dBFS throughout (`speech_detected: false`) |
+| `uncertain_speech` | text was transcribed but every segment is flagged (`status: uncertain`, `speech_detected: null`); words kept |
+| `failed` | audio exists but couldn't be measured (WAV, model or transcription failure); never evidence of no speech |
+| `absent` | no audio stream |
+| `unknown` | stream presence unknown (inspection failed) |
+
+File-level `flags`: `low_language_confidence` when the language was auto-detected with
+probability < 0.5 and something was transcribed (the text may be in the wrong script, or
+hallucinated). It adds a warning but doesn't change the status by itself. Use `--language` to
+force a language. All thresholds are in `SpeechConfig` and part of the cache key.
 
 Whisper detects one language per file, so code-switched speech (e.g.
 Hindi–English) may come out in one script. Lyrics in music can be transcribed
@@ -283,9 +330,10 @@ at scene cuts), in playback order. It holds every `segments.csv` column
 (times, `scene_index`, `scene_cut_at_start`, visual and audio values and
 statuses, unchanged), then the speech columns, the word links, the text
 columns, and a combined `notes`. Join keys are `video_id` + `segment_index`.
-`segments_merged_all.csv` holds the rows of every video processed in the
-**last** `run_speech_ocr.py` invocation, not everything under the artifacts
-root. Re-run with all wanted inputs to rebuild it.
+`segments_merged_all.csv` is rebuilt from every video's `segments_merged.csv` in the artifacts
+root (see [Run-level files](#run-level-files-artifactsfeatures)). Videos whose merged file
+predates the current columns are listed in `speech_ocr_run_summary.json ->
+excluded_stale_schema` until they're re-run.
 
 Values are empty (CSV) / `null` unless the window status is `available` or
 `uncertain`. They are never 0 for "not measured".
@@ -321,8 +369,6 @@ How to read the evidence in each row:
 | `text_event_ids` | `\|`-separated ints | `event_id`s of those events, for joining with `text_observations.csv` and `ocr.json -> events` (boxes, first/last seen) |
 | `librosa_*` | | per-segment librosa values, see [librosa audio features](#librosa-audio-features-librosajson) |
 | `siglip_*` | | per-segment SigLIP 2 values (opt-in), see [SigLIP 2](#siglip-2-visual-semantic-signals-siglipjson) |
-| `gemini_status` | status | file status of `gemini.json`; `uncertain` with note `gemini=not run (disabled)` when Gemini is off |
-| `gemini_moment_ids`, `gemini_suggestion_ids` | `\|`-separated ids | Gemini moments / edit suggestions whose interval overlaps the segment; details in `gemini.json` |
 | `recommendation_ids` | `\|`-separated ids | recommendations in `recommendations.json` whose interval overlaps the segment |
 | `notes` | | segment notes plus e.g. `speech=not extracted (stage skipped)`, `text=inferred between samples (no OCR sample in segment)`, `text=not sampled (beyond OCR range)` |
 
@@ -440,8 +486,8 @@ not a beat grid, and isn't reported for speech-only or short clips.
 Opt-in with `--siglip` (`run_speech_ocr.py`, `.venv-models`). Without the flag, nothing is
 loaded or written, and the `siglip_*` columns are `uncertain`/empty with note
 `siglip=not run (disabled)`. These are pretrained-model measurements, used as-is with no
-training. They're kept apart from Gemini's interpretations and from recommendations; no
-recommendation rule uses them yet.
+training. They're kept apart from the recommendations, except that one rule
+(`no_early_visual_change`) and the visual-change score point read `siglip_within_shot_change`.
 
 - **Model:** `google/siglip2-base-patch16-224`, pinned to revision
   `75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2`, loaded through `transformers` (`SiglipModel`) in
@@ -512,71 +558,17 @@ Semantic change isn't attention, and repeated imagery isn't boredom.
   `config.json` and doesn't affect pooled embeddings. Scores were checked against
   `SiglipModel.forward` logits (maximum difference 6e-9), and MPS against CPU embeddings (1e-6).
 
-### Gemini interpretation (`gemini.json`)
-
-Off by default (`--gemini off`). It's a model's interpretation of the video, kept apart from
-the measured evidence. It doesn't replace Whisper words or OCR text, and it isn't a retention,
-engagement or virality measurement.
-
-- **Modes:**
-  - `offline`: no network. Validates `--gemini-offline-response FILE`, or an empty skeleton.
-    `source = offline_fixture` and `model = null`, so fixture output is never attributed to a model.
-  - `remote`: uploads the original video file (with its audio) through the Files API and calls
-    `client.models.generate_content` (`google-genai`) with a JSON schema
-    (`response_json_schema`), at `--gemini-fps` (default 1) and `--gemini-media-resolution` (default
-    `low`). The upload is deleted afterwards.
-  - Model: `--gemini-model`, else `$GEMINI_MODEL`, else `gemini-3.8-flash`.
-- **Safeguards:**
-  - `remote` also needs `--gemini-allow-remote`, and videos under `01-Hookline/` need
-    `--gemini-approve <video_id>`. Otherwise nothing is sent and the status is `failed` with the reason.
-  - The key comes from `GEMINI_API_KEY` (environment, else the git-ignored `.env`; see
-    `.env.example`). It's never logged or stored, and error messages are scrubbed of it.
-- **Status:**
-  - `available`: valid output.
-  - `uncertain`: valid output, but some items were dropped by validation; or the file couldn't be
-    inspected (then nothing is sent).
-  - `absent`: no video or audio stream.
-  - `failed`: not sent (mode, permission, key, SDK), API error after retries, invalid JSON, or
-    schema violation.
-- **Errors and retries:** HTTP 408/429/5xx and timeouts are retried `--gemini-max-retries` times
-  (default 2) with 2, 4, … s back-off. `--gemini-timeout` is per request (default 180 s).
-- **Validation (local, pure Python):**
-  - A missing or wrongly typed top-level field is fatal.
-  - These items are dropped and listed in `validation.issues`: non-numeric times, start outside
-    `[0, duration)`, end before start, end more than 0.5 s past the duration, unknown
-    `kind`/`modality`/`category`, and confidence outside [0, 1].
-  - Ends up to 0.5 s past the duration are clamped. Point times (start = end) are widened to 0.5 s.
-  - Unexpected fields are ignored.
-  - Quoted passages of at least 12 characters are flagged `possible_quote`: use `words.csv` /
-    `text_observations.csv` for exact words.
-- **`analysis`:**
-  - `video_summary`, `narrative_progression` and `pacing` are text.
-  - `opening_hook` holds an `assessment` and evidence items `h*`.
-  - `moments` (`m*`, sorted by time) each have `start_s`, `end_s`, `kind`
-    (`observation`/`interpretation`), `modality`, `category`, `description` and `confidence`.
-  - `strengths` (`s*`) and `weaknesses` (`w*`) are evidence items.
-  - `edit_suggestions` (`e*`) each have `action`, `rationale`, `expected_effect`, `confidence` and
-    `evidence_moment_ids`.
-  - `uncertainties` is a list of text.
-- **Usage:**
-  - `api_calls` and `usage` (token counts from `usage_metadata`, null offline) are recorded.
-  - `cost.usd` is always null, because the API reports tokens, not prices.
-  - The run summary totals calls and tokens.
-- **Cache key:** source SHA-256 + mode + model + fps + media resolution + temperature +
-  prompt/schema version (+ offline fixture hash). It excludes timeouts, retries and permissions.
-  A failed call never overwrites a usable `gemini.json` (`cache.gemini_written = false`).
-
 ### Recommendations (`recommendations.json`)
 
-Each item has `id` (`r*`), `source` (`rule` or `gemini`), `basis` (`measured` or
-`model_interpretation`), `rule`, `start_s`/`end_s`, `suggestion`, `why`, `evidence` (a list of
-`{type, id}`) and `caveat`. Evidence types and where to find them:
+Each item has `id` (`r*`), `source` (always `rule`), `basis` (always `measured`), `rule`,
+`start_s`/`end_s`, `suggestion`, `why`, `evidence` (a list of `{type, id}`) and `caveat`.
+They are transparent rule-based observations over measured features: no language model or
+external API is involved. Evidence types and where to find them:
 
 - `segment`: `segment_index`
 - `word`: `words.csv` `word_index`
 - `text_event`: `ocr.json` / `text_observations.csv` `event_id`
 - `librosa_interval`: `librosa.json` `interval_id`
-- `gemini_moment`, `gemini_suggestion`: `gemini.json` ids
 
 `evidence_problems` lists any id that doesn't exist. It's checked on every run and should be empty.
 
@@ -589,7 +581,36 @@ evidence it needs was measured, never on missing, failed or uncertain modalities
 | `opening_without_words` | speech measured with no word, and every OCR sample in the first 3 s succeeded and read nothing |
 | `quiet_stretch` | a librosa low-energy interval of at least 1.5 s, audio `available`, no transcribed word overlaps it, not the clip's final 0.25 s |
 | `static_stretch` | at least 3 s in one scene with `motion_mean` < 1.0 in every segment (about the lowest 7 % of company-reel segments) |
-| `gemini_suggestion` | a validated Gemini edit suggestion, with its supporting moment ids |
+| `no_early_visual_change` | clip of at least 6 s, vision `available` for every segment of the first 3 s, no scene cut after 0 s and no SigLIP `siglip_within_shot_change` of 0.15 or more in that window (SigLIP is optional: without it the observation says so) |
+| `long_shot` | a scene (between detected cuts) of at least 10 s with vision `available` in every segment |
+| `repeated_text` | an OCR text event that reappears after disappearing (`repeat_of` points to the earlier event); cites both events |
+
+### Segment scores (`scores.json`, `segment_scores.csv`, run-level `segment_scores_all.csv`)
+
+Two separate 0–100 heuristics per segment, rebuilt on every run from the merged timeline and the
+rule-based recommendations (scoring version 2: measured evidence only):
+- `moment_quality`: evidence that the stretch works.
+- `attention_risk`: evidence that a viewer might lose interest.
+
+A segment can be high on both, or low on both. 0 means no evidence either way, not "bad".
+
+| `attention_risk` points | | `moment_quality` points | |
+| --- | --- | --- | --- |
+| rule recommendation (measured) | 15 each | transcribed speech | 5 |
+| motion_mean < 1.0 | 5 | on-screen text observed | 5 |
+| near-silent + no speech (measured) | 5 | scene cut or SigLIP within-shot change ≥ 0.15 | 5 |
+
+- Each total is capped at 100.
+- Every point is listed in `risk_contributions` / `quality_contributions` (`source`: rule /
+  measured, `reason`, `points`, `ref`).
+- A recommendation overlaps a segment when its interval intersects it (end-exclusive).
+- Missing, failed or uncertain modalities contribute nothing.
+- `basis` is always `measured_only`. Scores written by scoring version 1 (which could include
+  language-model judgments) are not comparable; re-run to rebuild them.
+- `highest_attention_risk` / `highest_moment_quality` rank spans: adjacent segments with the same
+  top reason, scored by their peak.
+- The weights are hand-set, not calibrated or trained on outcomes. These aren't retention,
+  engagement or virality predictions.
 
 ### Opening summary (`opening_multimodal.json`, `first5s_multimodal.csv`)
 
@@ -609,7 +630,6 @@ speech and text:
   persistent in the opening first).
 - `librosa` (JSON only): `status`, low-energy intervals starting in the opening, `tempo_bpm`,
   `tempo_status` (whole-clip tempo).
-- `gemini` (JSON only): `status` and Gemini's `opening_hook`, labelled as model interpretation.
 - `stage_status`, `features_status`, `note`.
 
 `speech_detected` / `text_detected` is `false` only if every opening window
@@ -619,16 +639,16 @@ retention prediction.
 
 ### Stage status (`stage_status`, `speech_ocr_run_summary.json`)
 
-Requested modalities are speech, OCR, librosa (unless `--skip-librosa`), SigLIP (with `--siglip`)
-and Gemini (when not `off`):
+Requested modalities are speech, OCR, librosa (unless `--skip-librosa`) and SigLIP (with `--siglip`).
+TRIBE v2 is not part of the stage status:
 - `ok`: every requested modality is `available` or `absent` and no window `failed`.
 - `failed`: every requested modality is `failed` or `uncertain` (for example, models not
   installed, or an unreadable file).
-- `partial`: anything else. For example, a Gemini result with dropped items (`uncertain`)
-  makes a video `partial`.
+- `partial`: anything else. For example, an uncertain or partly failed modality makes a video
+  `partial`.
 
 `run_speech_ocr.py` exits with 1 if any video failed. The run summary also records
-`gemini_api_calls` and `gemini_tokens`.
+`tribe_requests_sent` (videos sent to the TRIBE endpoint in that run).
 
 ### Caching
 
@@ -645,3 +665,23 @@ and Gemini (when not `off`):
   machine (e.g. a Kaggle GPU) are reused when copied into the same
   `artifacts/features/<video_id>/` and the same flags are used locally
   (device is not part of the key; compute type is).
+
+## TTCC predicted retention (`run_ttcc.py`, opt-in)
+
+These are not features. They are a pretrained model's prediction, kept apart from every measured
+column and every heuristic score. Full documentation is in [ttcc.md](ttcc.md).
+
+- `ttcc_retention.json`:
+  - `timestamps_s`: whole seconds 0..T, where T = round(duration_s) and 5 ≤ T ≤ 60.
+  - `retention`: R(t), the predicted fraction of viewers (0–1) still watching at second t.
+    R(0) = 1 by convention. The values are non-increasing.
+  - The record also holds `convention`, `summary`, `inference` (settings, token count, attention
+    anchor), `provenance` (checkpoint revision and files, go_viral commit and `register.py` hash,
+    library versions, verified retention head, GPU) and `raw_output` (path and SHA-256 of
+    `ttcc_raw.json`).
+- The 1 s grid is TTCC's own. It is not resampled onto the 0.5 s segments, and no TTCC column is
+  added to `segments_merged.csv`.
+- `ttcc_status.json`: `status` is `success`, `failed` or `unavailable`, plus `stage`, `reason`,
+  `cache_key` and `prediction_is_current`. Without a successful run there is no curve; nothing is
+  filled in.
+

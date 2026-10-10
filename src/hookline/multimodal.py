@@ -11,9 +11,10 @@ Per video, in ``<artifacts>/features/<video_id>/``:
 - ``text_observations.csv``: one row per OCR sample/detection, sample time, box, segment
 - ``opening_multimodal.json``: first-5-s summary combining visual, audio, speech and text
 - ``librosa.json``: librosa audio features per segment, low-energy intervals, global tempo
-- ``gemini.json``: Gemini interpretation (only when enabled; off by default)
-- ``recommendations.json``: rule-based and Gemini edit suggestions, each citing evidence ids
+- ``recommendations.json``: rule-based edit observations, each citing evidence ids
 - ``siglip.json`` + ``siglip_embeddings.npy``: SigLIP 2 frame embeddings and description scores (opt-in)
+- ``tribe.json`` + ``tribe_preds.npy``: TRIBE v2 predicted brain responses from a remote endpoint (opt-in;
+  kept out of the segment timeline, scores and status: a separate model output, not a feature)
 Run level, in ``<artifacts>/features/``: ``segments_merged_all.csv``,
 ``first5s_multimodal.csv``, ``speech_ocr_run_summary.json``.
 
@@ -22,31 +23,41 @@ Nothing here scores attention or predicts engagement.
 
 from __future__ import annotations
 
-import csv
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .config import GeminiConfig, LibrosaConfig, OcrConfig, PipelineConfig, SiglipConfig, SpeechConfig
+from .config import LibrosaConfig, OcrConfig, PipelineConfig, SiglipConfig, SpeechConfig, TribeConfig
 from .context import LazyBackend, MediaContext
-from .features import OPENING_NOTE, SEGMENT_COLUMNS, _csv_value
-from .gemini import GEMINI_COLUMNS, GeminiTransport, extract_gemini, gemini_key, gemini_window
+from .features import OPENING_NOTE, SEGMENT_COLUMNS
 from .librosa_audio import LIBROSA_COLUMNS, extract_librosa, librosa_key, librosa_window, opening_librosa
 from .ocr import OBSERVATION_COLUMNS, TEXT_COLUMNS, extract_ocr, observation_rows, ocr_key, opening_text, text_window
 from .paths import artifacts_dir
-from .pipeline import VideoInput, _write_csv, default_inputs, discover, process_video
+from .pipeline import (
+    VideoInput,
+    _load_report,
+    _write_csv,
+    concat_video_csvs,
+    default_inputs,
+    discover,
+    load_features,
+    merge_run_summary,
+    video_dirs,
+)
 from .recommendations import build_recommendations, evidence_index, invalid_evidence, recommendation_ids
+from .scoring import SCORE_COLUMNS, score_video
 from .siglip import SIGLIP_COLUMNS, extract_siglip, frame_selection, read_frame_times, siglip_key, siglip_window, write_siglip
 from .segments import overlap
 from .speech import SPEECH_COLUMNS, WORD_COLUMNS, extract_speech, opening_speech, speech_key, speech_window, word_rows
 from .status import ABSENT, ALL_STATUSES, AVAILABLE, FAILED, UNCERTAIN
+from .tribe import cached_tribe, extract_tribe, tribe_key, write_tribe
 
 # Links into words.csv (word_index) and text_observations.csv / ocr.json (event_id).
 WORD_LINK_COLUMNS = ["speech_word_index_first", "speech_word_index_last"]
 MERGED_COLUMNS = ([c for c in SEGMENT_COLUMNS if c != "notes"] + SPEECH_COLUMNS + WORD_LINK_COLUMNS + TEXT_COLUMNS
-                  + LIBROSA_COLUMNS + SIGLIP_COLUMNS + GEMINI_COLUMNS + ["recommendation_ids", "notes"])
+                  + LIBROSA_COLUMNS + SIGLIP_COLUMNS + ["recommendation_ids", "notes"])
 LEGACY_OUTPUTS = ("segments_speech_text.csv", "segments_speech_text_all.csv")
 OPENING_MM_COLUMNS = [
     "video_id", "stage_status", "features_status", "duration_s", "analysed_seconds", "shorter_than_opening_window",
@@ -63,8 +74,8 @@ OPENING_MM_COLUMNS = [
 class Backends:
     speech: LazyBackend | None = None
     ocr: LazyBackend | None = None
-    gemini: Callable[[], GeminiTransport] | None = None  # None: offline fixture or the real SDK, per GeminiConfig.mode
     siglip: LazyBackend | None = None
+    tribe: Callable[[str, str], Any] | None = None  # (url, token) -> transport; None: HTTPS to the endpoint
 
 
 def _load_json(path: Path) -> dict | None:
@@ -91,9 +102,9 @@ def _cached(path: Path, key: str, force: bool) -> dict | None:
 
 
 def merged_rows(ctx: MediaContext, speech: dict | None, ocr: dict | None, min_coverage: float,
-                words: list[dict] | None = None, librosa: dict | None = None, gemini: dict | None = None,
+                words: list[dict] | None = None, librosa: dict | None = None,
                 siglip: dict | None = None) -> list[dict]:
-    """Existing segment rows (visual/audio untouched) extended with speech, text, librosa and Gemini
+    """Existing segment rows (visual/audio untouched) extended with speech, text, librosa and SigLIP
     columns. ``words`` are ``word_rows(speech, ctx.segments)``; computed here if not given.
     ``recommendation_ids`` is filled in by ``process_video_multimodal``."""
     rows = []
@@ -106,11 +117,10 @@ def merged_rows(ctx: MediaContext, speech: dict | None, ocr: dict | None, min_co
         t, t_notes = text_window(ocr, seg, ctx.video_span, min_coverage)
         lr, lr_notes = librosa_window(librosa, seg)
         sg, sg_notes = siglip_window(siglip, seg)
-        g, g_notes = gemini_window(gemini, seg)
         idx = by_segment.get(seg["segment_index"]) if s["speech_status"] in (AVAILABLE, UNCERTAIN) else None
         link = {"speech_word_index_first": min(idx) if idx else None, "speech_word_index_last": max(idx) if idx else None}
-        row = {k: seg.get(k) for k in MERGED_COLUMNS if k != "notes"} | s | link | t | lr | sg | g
-        row["notes"] = "; ".join([n for n in [seg.get("notes")] if n] + s_notes + t_notes + lr_notes + sg_notes + g_notes)
+        row = {k: seg.get(k) for k in MERGED_COLUMNS if k != "notes"} | s | link | t | lr | sg
+        row["notes"] = "; ".join([n for n in [seg.get("notes")] if n] + s_notes + t_notes + lr_notes + sg_notes)
         rows.append(row)
     return rows
 
@@ -125,7 +135,7 @@ def _status_coverage(rows: list[dict], column: str, end: float) -> dict[str, flo
 
 
 def opening_multimodal(ctx: MediaContext, speech: dict | None, ocr: dict | None, rows: list[dict], opening_seconds: float,
-                       librosa: dict | None = None, gemini: dict | None = None) -> dict:
+                       librosa: dict | None = None) -> dict:
     duration = ctx.duration or 0.0
     end = min(opening_seconds, duration)
     in_open = [r for r in rows if overlap(r["start_s"], r["end_s"], 0.0, end) > 0]
@@ -149,9 +159,6 @@ def opening_multimodal(ctx: MediaContext, speech: dict | None, ocr: dict | None,
         "speech": opening_speech(speech, in_open, end) | {"status_coverage": _status_coverage(in_open, "speech_status", end)},
         "text": opening_text(ocr, end) | {"status_coverage": _status_coverage(in_open, "text_status", end)},
         "librosa": opening_librosa(librosa, end),
-        "gemini": {"status": None if gemini is None else gemini["status"],
-                   "opening_hook": ((gemini or {}).get("analysis") or {}).get("opening_hook"),
-                   "kind": "model interpretation, not measurement"},
         "note": OPENING_NOTE,
     }
 
@@ -169,17 +176,6 @@ def stage_status(artifacts: list[dict], rows: list[dict]) -> str:
     return "failed"
 
 
-def _write_unless_downgrade(path: Path, art: dict) -> bool:
-    """Write an artifact, except a failure over an existing usable one (e.g. a rate-limited
-    re-run must not destroy an earlier good Gemini result). Returns True if written."""
-    if art["status"] == FAILED:
-        old = _load_json(path)
-        if old and old.get("measured"):
-            return False
-    _write_json(path, art)
-    return True
-
-
 def process_video_multimodal(
     item: VideoInput,
     root: str | Path | None = None,
@@ -191,26 +187,26 @@ def process_video_multimodal(
     run_ocr: bool = True,
     force: bool = False,
     librosa_cfg: LibrosaConfig | None = None,
-    gemini_cfg: GeminiConfig | None = None,
     run_librosa: bool = True,
     siglip_cfg: SiglipConfig | None = None,
     run_siglip: bool = False,
+    tribe_cfg: TribeConfig | None = None,
 ) -> dict:
-    """Speech, OCR, librosa and (if enabled) SigLIP and Gemini for one video, then the merged
+    """Speech, OCR, librosa and (if enabled) SigLIP and TRIBE v2 for one video, then the merged
     timeline and recommendations. Reuses cached preprocessing/features (computes them if missing)."""
     cfg, speech_cfg, ocr_cfg = cfg or PipelineConfig(), speech_cfg or SpeechConfig(), ocr_cfg or OcrConfig()
-    librosa_cfg, gemini_cfg = librosa_cfg or LibrosaConfig(), gemini_cfg or GeminiConfig()
-    siglip_cfg = siglip_cfg or SiglipConfig()
+    librosa_cfg = librosa_cfg or LibrosaConfig()
+    siglip_cfg, tribe_cfg = siglip_cfg or SiglipConfig(), tribe_cfg or TribeConfig()
     backends = backends or Backends()
     root = Path(root) if root else artifacts_dir()
-    report = process_video(item, cfg, root)
+    report = load_features(item, cfg, root)  # read-only: Task 2 runs in the feature environment
     features_cached = (report.pop("_cache", None) or {}).get("features")
     ctx = MediaContext.from_report(report)
     out_dir = root / "features" / item.video_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cache: dict[str, Any] = {"features": features_cached, "speech": None, "ocr": None, "librosa": None, "gemini": None}
-    speech = ocr = librosa = gemini = siglip = None
+    cache: dict[str, Any] = {"features": features_cached, "speech": None, "ocr": None, "librosa": None}
+    speech = ocr = librosa = siglip = None
     if run_speech:
         path = out_dir / "speech.json"
         speech = _cached(path, speech_key(ctx, speech_cfg), force)
@@ -242,22 +238,21 @@ def process_video_multimodal(
         if siglip is None:
             siglip, emb = extract_siglip(ctx, siglip_cfg, backends.siglip, frame_times)
             cache["siglip_written"] = write_siglip(out_dir, siglip, emb, _write_json)
-    if gemini_cfg.mode != "off":
-        path = out_dir / "gemini.json"
-        gemini = _cached(path, gemini_key(ctx, gemini_cfg), force)
-        cache["gemini"] = gemini is not None
-        if gemini is None:
-            gemini = extract_gemini(ctx, gemini_cfg, backends.gemini)
-            cache["gemini_written"] = _write_unless_downgrade(path, gemini)
-
     words = word_rows(speech, ctx.segments)
-    rows = merged_rows(ctx, speech, ocr, cfg.min_coverage, words, librosa, gemini, siglip)
-    recs = build_recommendations(rows, words, ocr, librosa, gemini, ctx.duration)
-    problems = invalid_evidence(recs, evidence_index(rows, words, ocr, librosa, gemini))
+    tribe = None
+    if tribe_cfg.enabled:  # remote model output kept apart from the timeline; a failure changes nothing else
+        tribe = None if force else cached_tribe(out_dir, tribe_key(ctx, tribe_cfg))
+        cache["tribe"] = tribe is not None
+        if tribe is None:
+            tribe, preds = extract_tribe(ctx, tribe_cfg, backends.tribe)
+            cache["tribe_written"] = write_tribe(out_dir, tribe, preds, _write_json)
+    rows = merged_rows(ctx, speech, ocr, cfg.min_coverage, words, librosa, siglip)
+    recs = build_recommendations(rows, words, ocr, librosa, ctx.duration)
+    problems = invalid_evidence(recs, evidence_index(rows, words, ocr, librosa))
     for row in rows:
         row["recommendation_ids"] = recommendation_ids(recs, row)
-    status = stage_status([a for a in (speech, ocr, librosa, siglip, gemini) if a is not None], rows)
-    opening = opening_multimodal(ctx, speech, ocr, rows, cfg.opening_seconds, librosa, gemini)
+    status = stage_status([a for a in (speech, ocr, librosa, siglip) if a is not None], rows)
+    opening = opening_multimodal(ctx, speech, ocr, rows, cfg.opening_seconds, librosa)
     opening.update(stage_status=status, features_status=ctx.processing_status, duration_s=ctx.duration)
     _write_csv(out_dir / "segments_merged.csv", MERGED_COLUMNS, rows)
     _write_csv(out_dir / "words.csv", WORD_COLUMNS, words)
@@ -268,10 +263,13 @@ def process_video_multimodal(
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "note": "Edit suggestions grounded in the listed evidence. Not a retention, engagement or virality prediction.",
         "inputs": {name: None if a is None else a["status"] for name, a in
-                   (("speech", speech), ("ocr", ocr), ("librosa", librosa), ("siglip", siglip), ("gemini", gemini))},
+                   (("speech", speech), ("ocr", ocr), ("librosa", librosa), ("siglip", siglip))},
         "evidence_problems": problems,
         "recommendations": recs,
     })
+    scores = score_video(item.video_id, rows, recs)
+    _write_json(out_dir / "scores.json", scores)
+    _write_csv(out_dir / "segment_scores.csv", SCORE_COLUMNS, scores["segments"])
     (out_dir / LEGACY_OUTPUTS[0]).unlink(missing_ok=True)
     return {
         "video_id": item.video_id,
@@ -282,8 +280,9 @@ def process_video_multimodal(
         "ocr": ocr,
         "librosa": librosa,
         "siglip": siglip,
-        "gemini": gemini,
+        "tribe": tribe,
         "recommendations": recs,
+        "scores": scores,
         "rows": rows,
         "opening": opening,
         "cache": cache,
@@ -324,6 +323,8 @@ def _record(res: dict) -> dict:
         "features_status": res.get("features_status"),
         "speech_status": s.get("status"),
         "speech_detected": s.get("speech_detected"),
+        "speech_result": s.get("speech_result"),
+        "speech_flags": s.get("flags") or None,
         "speech_language": s.get("language"),
         "speech_reason": s.get("reason"),
         "speech_timing": s.get("timing"),
@@ -338,11 +339,12 @@ def _record(res: dict) -> dict:
         "siglip_status": (res.get("siglip") or {}).get("status"),
         "siglip_reason": (res.get("siglip") or {}).get("reason"),
         "siglip_timing": (res.get("siglip") or {}).get("timing"),
-        "gemini_status": (res.get("gemini") or {}).get("status"),
-        "gemini_reason": (res.get("gemini") or {}).get("reason"),
-        "gemini_source": (res.get("gemini") or {}).get("source"),
-        "gemini_api_calls": (res.get("gemini") or {}).get("api_calls"),
-        "gemini_usage": (res.get("gemini") or {}).get("usage"),
+        "tribe_status": (res.get("tribe") or {}).get("status"),
+        "tribe_reason": (res.get("tribe") or {}).get("reason"),
+        "tribe_sent": (res.get("tribe") or {}).get("sent"),
+        "tribe_cached": (res.get("cache") or {}).get("tribe"),
+        "score_basis": (res.get("scores") or {}).get("basis"),
+        "highest_attention_risk": ((res.get("scores") or {}).get("highest_attention_risk") or [])[:3],
         "recommendations": len(res.get("recommendations") or []) if res.get("rows") else None,
         "cache": res.get("cache"),
         "error": res.get("error"),
@@ -354,14 +356,15 @@ def _log_line(i: int, n: int, rec: dict) -> str:
         return f"{name}={status}" + (f"({detail})" if detail and status else "")
 
     s_detail = {True: "speech", False: "no speech", None: ""}[rec["speech_detected"]]
+    if rec.get("speech_result") == "uncertain_speech":
+        s_detail = "uncertain speech: every segment flagged"
     if rec["speech_language"] and rec["speech_detected"]:
         s_detail += f", {rec['speech_language']}"
     t_detail = f"{rec['text_events']} text events" if rec["text_detected"] is not None else ""
     cache = rec.get("cache") or {}
-    cached = ",".join(k for k in ("speech", "ocr", "librosa", "siglip", "gemini") if cache.get(k))
+    cached = ",".join(k for k in ("speech", "ocr", "librosa", "siglip", "tribe") if cache.get(k))
     reason = rec.get("error") or next((rec[f"{m}_reason"] for m, st in (("speech", "speech_status"), ("text", "text_status"),
-                                                                        ("librosa", "librosa_status"), ("siglip", "siglip_status"),
-                                                                        ("gemini", "gemini_status"))
+                                                                        ("librosa", "librosa_status"), ("siglip", "siglip_status"))
                                        if rec.get(st) == FAILED and rec.get(f"{m}_reason")), None)
     extra = ""
     if rec.get("librosa_status"):
@@ -369,14 +372,32 @@ def _log_line(i: int, n: int, rec: dict) -> str:
     if rec.get("siglip_status"):
         t = rec.get("siglip_timing") or {}
         extra += ", " + part("siglip", rec["siglip_status"], f"{t['frames']} frames on {t['device']}" if t.get("frames") else "")
-    if rec.get("gemini_status"):
-        extra += ", " + part("gemini", rec["gemini_status"], f"{rec['gemini_source']}, {rec['gemini_api_calls']} API calls"
-                             if rec.get("gemini_source") else "")
+    if rec.get("tribe_status"):
+        t_detail = "cached" if rec.get("tribe_cached") else (rec.get("tribe_reason") or "")[:80]
+        extra += ", " + part("tribe", rec["tribe_status"], t_detail)
     if rec.get("recommendations") is not None:
         extra += f", {rec['recommendations']} recommendations"
     return (f"[{i}/{n}] {rec['video_id']}: {rec['status']} ({part('speech', rec['speech_status'], s_detail)}, "
             f"{part('text', rec['text_status'], t_detail)}{extra}{', cached ' + cached if cached else ''})"
             + (f" reason: {reason[:160]}" if reason and rec["status"] != "ok" else ""))
+
+
+def write_multimodal_aggregates(features_root: Path) -> list[str]:
+    """``segments_merged_all.csv`` and ``first5s_multimodal.csv`` from every video in the root
+    (sorted by id). Videos whose per-video files use an older schema are left out and returned."""
+    stale = concat_video_csvs(features_root, "segments_merged.csv", MERGED_COLUMNS, features_root / "segments_merged_all.csv")
+    stale += [v for v in concat_video_csvs(features_root, "segment_scores.csv", SCORE_COLUMNS,
+                                           features_root / "segment_scores_all.csv") if v not in stale]
+    rows = []
+    for d in video_dirs(features_root, "opening_multimodal.json"):
+        o = _load_report(d / "opening_multimodal.json")
+        try:
+            rows.append(opening_row(o))
+        except (KeyError, TypeError):
+            if d.name not in stale:
+                stale.append(d.name)
+    _write_csv(features_root / "first5s_multimodal.csv", OPENING_MM_COLUMNS, rows)
+    return sorted(stale)
 
 
 def run_multimodal(
@@ -392,60 +413,53 @@ def run_multimodal(
     limit: int | None = None,
     log=print,
     librosa_cfg: LibrosaConfig | None = None,
-    gemini_cfg: GeminiConfig | None = None,
     run_librosa: bool = True,
     siglip_cfg: SiglipConfig | None = None,
     run_siglip: bool = False,
+    tribe_cfg: TribeConfig | None = None,
 ) -> dict:
     """Batch version of ``process_video_multimodal``; one video in memory at a time."""
     cfg, speech_cfg, ocr_cfg = cfg or PipelineConfig(), speech_cfg or SpeechConfig(), ocr_cfg or OcrConfig()
-    librosa_cfg, gemini_cfg = librosa_cfg or LibrosaConfig(), gemini_cfg or GeminiConfig()
-    siglip_cfg = siglip_cfg or SiglipConfig()
+    librosa_cfg = librosa_cfg or LibrosaConfig()
+    siglip_cfg, tribe_cfg = siglip_cfg or SiglipConfig(), tribe_cfg or TribeConfig()
     root = Path(root) if root else artifacts_dir()
     inputs = [Path(p) for p in (inputs or default_inputs())]
     videos = discover(inputs)[: limit or None]
     features_root = root / "features"
     features_root.mkdir(parents=True, exist_ok=True)
-    seg_path, open_path = features_root / "segments_merged_all.csv", features_root / "first5s_multimodal.csv"
-    seg_tmp, open_tmp = seg_path.with_suffix(".csv.tmp"), open_path.with_suffix(".csv.tmp")
 
     records = []
-    with seg_tmp.open("w", newline="") as fs, open_tmp.open("w", newline="") as fo:
-        seg_w = csv.DictWriter(fs, fieldnames=MERGED_COLUMNS, extrasaction="ignore")
-        open_w = csv.DictWriter(fo, fieldnames=OPENING_MM_COLUMNS, extrasaction="ignore")
-        seg_w.writeheader()
-        open_w.writeheader()
-        for i, item in enumerate(videos, 1):
-            try:
-                res = process_video_multimodal(item, root, cfg, speech_cfg, ocr_cfg, backends, run_speech, run_ocr, force,
-                                               librosa_cfg, gemini_cfg, run_librosa, siglip_cfg, run_siglip)
-            except Exception as exc:  # isolate per-video failures
-                res = {"video_id": item.video_id, "source_path": str(item.path), "status": "failed",
-                       "error": f"pipeline error: {type(exc).__name__}: {exc}", "rows": [], "opening": None}
-            for row in res["rows"]:
-                seg_w.writerow({k: _csv_value(row.get(k)) for k in MERGED_COLUMNS})
-            if res["opening"]:
-                open_w.writerow({k: _csv_value(v) for k, v in opening_row(res["opening"]).items()})
-            rec = _record(res)
-            records.append(rec)
-            log(_log_line(i, len(videos), rec))
-    seg_tmp.replace(seg_path)
-    open_tmp.replace(open_path)
-    (features_root / LEGACY_OUTPUTS[1]).unlink(missing_ok=True)
+    for i, item in enumerate(videos, 1):
+        try:
+            res = process_video_multimodal(item, root, cfg, speech_cfg, ocr_cfg, backends, run_speech, run_ocr, force,
+                                           librosa_cfg, run_librosa, siglip_cfg, run_siglip, tribe_cfg)
+        except Exception as exc:  # isolate per-video failures
+            res = {"video_id": item.video_id, "source_path": str(item.path), "status": "failed",
+                   "error": f"{type(exc).__name__}: {exc}", "rows": [], "opening": None}
+        rec = _record(res)
+        records.append(rec)
+        log(_log_line(i, len(videos), rec))
+        del res  # one video in memory at a time
 
-    counts = {s: sum(1 for r in records if r["status"] == s) for s in ("ok", "partial", "failed")}
-    summary = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "inputs": [str(p) for p in inputs],
-        "artifacts_root": str(root),
-        "stages": {"speech": run_speech, "ocr": run_ocr, "librosa": run_librosa, "siglip": run_siglip, "gemini": gemini_cfg.mode},
-        "config": {"pipeline": cfg.to_dict(), "speech": speech_cfg.to_dict(), "ocr": ocr_cfg.to_dict(),
-                   "librosa": librosa_cfg.to_dict(), "siglip": siglip_cfg.to_dict(),
-                   "gemini": {k: v for k, v in gemini_cfg.to_dict().items() if k != "protected_roots"}},
-        "counts": {"videos": len(records), **counts},
-        "gemini_api_calls": sum(r.get("gemini_api_calls") or 0 for r in records),
-        "gemini_tokens": sum(((r.get("gemini_usage") or {}).get("total_token_count") or 0) for r in records) or None,
-        "videos": records,
-    }
-    _write_json(features_root / "speech_ocr_run_summary.json", summary)
+    stale = write_multimodal_aggregates(features_root)
+    if stale:
+        log(f"run-level files exclude {len(stale)} videos with older per-video outputs (re-run them): {', '.join(stale[:10])}")
+    (features_root / LEGACY_OUTPUTS[1]).unlink(missing_ok=True)
+    backfill = {}
+    for d in video_dirs(features_root, "opening_multimodal.json"):
+        o = _load_report(d / "opening_multimodal.json") or {}
+        backfill[d.name] = {"video_id": d.name, "status": o.get("stage_status"), "features_status": o.get("features_status")}
+    summary = merge_run_summary(
+        features_root / "speech_ocr_run_summary.json", records, "status", backfill=backfill,
+        last_run={
+            "inputs": [str(p) for p in inputs],
+            "stages": {"speech": run_speech, "ocr": run_ocr, "librosa": run_librosa, "siglip": run_siglip,
+                       "tribe": tribe_cfg.enabled},
+            "config": {"pipeline": cfg.to_dict(), "speech": speech_cfg.to_dict(), "ocr": ocr_cfg.to_dict(),
+                       "librosa": librosa_cfg.to_dict(), "siglip": siglip_cfg.to_dict(),
+                       "tribe": {k: v for k, v in tribe_cfg.to_dict().items() if k != "protected_roots"}},
+            "tribe_requests_sent": sum(1 for r in records if r.get("tribe_sent") and not r.get("tribe_cached")),
+        },
+        extra={"excluded_stale_schema": stale},
+    )
     return summary

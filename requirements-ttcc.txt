@@ -1,0 +1,28 @@
+# TTCC retention inference (scripts/ttcc_infer.py), in its OWN environment: never .venv or
+# .venv-models. ms-swift (the go_viral fork) needs transformers<5.9, and .venv-models has 5.19.
+# Install go_viral first, which brings ms-swift's own requirements:
+#   git clone -b ttcc-rl https://github.com/cliangyu/go_viral && git -C go_viral checkout 893da03bccee6a18d221e96c5de55c9b35a8e350
+#   pip install -e go_viral
+#   pip install -r requirements-ttcc.txt
+# Runs on a CUDA GPU, on Apple Silicon (MPS) or on CPU; the device and attention kernel are detected
+# (docs/ttcc.md). Verified install on a MacBook Air M2 (macOS 26.5, Python 3.11.9), 2026-10-10:
+#   uv venv --python 3.11 .venv-ttcc
+#   uv pip install --python .venv-ttcc/bin/python torch==2.11.0 torchvision==0.26.0
+#   uv pip install --python .venv-ttcc/bin/python -e ./go_viral
+#   uv pip install --python .venv-ttcc/bin/python -r requirements-ttcc.txt
+#
+# Versions: the v8 checkpoint was saved with transformers 4.56.2 (its config.json), and the V8
+# integrity audit in go_viral lists transformers 4.56.2 and torch 2.12.0. A later go_viral lock file
+# (requirements.lock) has transformers 5.8.1 and torch 2.11.0. Neither combination has been run by
+# Hookline. The versions actually used are recorded in every prediction and are part of its cache key.
+transformers==4.56.2
+qwen-omni-utils==0.0.9   # video loading for Qwen2.5-Omni (fetch_video)
+decord==0.6.0; sys_platform == "linux"          # video reader used upstream (Linux wheels only)
+eva-decord==0.6.1; sys_platform == "darwin"     # same decord API with macOS arm64 wheels (torchvision>=0.24 has no read_video)
+accelerate>=1.0
+peft>=0.11,<0.20         # ms-swift constraint
+safetensors>=0.4
+huggingface_hub>=0.30
+numpy
+# torch: on CUDA keep the platform's build (e.g. Kaggle's) or one matching your driver; on macOS torch==2.11.0 (above).
+# Optional, Ampere or newer only:  pip install flash-attn==2.8.3 --no-build-isolation

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Print a readable view of one video's feature report (plus speech/OCR if run_speech_ocr.py ran).
+"""Print a readable view of one video's feature report (plus speech/OCR if run_speech_ocr.py ran,
+and TTCC predicted retention if run_ttcc.py ran).
 
     python scripts/show_features.py syn_av_testpattern_8s
     python scripts/show_features.py syn_av_testpattern_8s --segments 20
@@ -55,6 +56,20 @@ def show_speech_text(out_dir: Path, limit: int = 8) -> None:
             print(f"  ... {len(items) - limit} more")
 
 
+def show_ttcc(out_dir: Path) -> None:
+    """TTCC status and predicted retention from run_ttcc.py, if present (a prediction, not a measurement)."""
+    st_path, art_path = out_dir / "ttcc_status.json", out_dir / "ttcc_retention.json"
+    if not st_path.exists() and not art_path.exists():
+        return
+    st = json.loads(st_path.read_text()) if st_path.exists() else {}
+    print(f"\nttcc (predicted retention): latest attempt {st.get('status')}" + (f"  ({st['reason']})" if st.get("reason") else ""))
+    art = json.loads(art_path.read_text()) if art_path.exists() else None
+    if art and art.get("status") == "success":
+        current = "" if st.get("prediction_is_current") else "  [not confirmed current]"
+        pairs = "  ".join(f"{t}s:{r:.3f}" for t, r in zip(art["timestamps_s"], art["retention"]))
+        print(f"  R(t), fraction of viewers, 1 s steps{current}: {pairs}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("video_id", nargs="?")
@@ -93,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  audio: {o['audio']}")
     print(f"scene cuts: {r.get('scene_cut_times')}")
     show_speech_text(features / args.video_id)
+    show_ttcc(features / args.video_id)
 
     segs = r.get("segments") or []
     n = len(segs) if args.segments == 0 else args.segments

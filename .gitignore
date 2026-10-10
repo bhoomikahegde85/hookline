@@ -21,6 +21,10 @@ __pycache__/
 hf_token*
 credentials*.json
 
+# Upstream TTCC code (github.com/cliangyu/go_viral, branch ttcc-rl): a local clone used by
+# scripts/ttcc_infer.py, never vendored into this repository
+go_viral/
+
 # Hackathon-provided company dataset: never commit or redistribute
 01-Hookline/
 *.zip

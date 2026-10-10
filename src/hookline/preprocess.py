@@ -21,6 +21,7 @@ from typing import Any
 
 from .config import PipelineConfig, file_sha256, stable_hash
 from .media import STATUS_OK, ProbeResult, find_tool, probe_video
+from .provenance import ffmpeg_version
 from .status import AVAILABLE, UNCERTAIN, stream_status
 
 FFMPEG_TIMEOUT = 600
@@ -52,6 +53,7 @@ class PreprocessResult:
     timestamp_map: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    ffmpeg_version: str | None = None  # FFmpeg that made the proxy/WAV; None in caches that predate provenance
     cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -137,6 +139,9 @@ def load_cached(cache_dir: Path, key: str) -> PreprocessResult | None:
         return None
     if data.get("key") != key:
         return None
+    made_with = data.get("ffmpeg_version")
+    if made_with is not None and made_with != ffmpeg_version():
+        return None  # proxy/WAV encoded by a different FFmpeg: rebuild rather than mix
     for p in (data.get("proxy_path"), data.get("audio_path")):
         if p and not Path(p).is_file():
             return None
@@ -185,6 +190,7 @@ def preprocess(source: str | Path, video_id: str, cache_root: str | Path, cfg: P
         cache_dir=str(cache_dir),
         status="failed",
         probe=probe.to_dict(),
+        ffmpeg_version=ffmpeg_version(ffmpeg),
     )
     if probe.status != STATUS_OK:
         # Inspection failure: presence of streams is unknown, not absent.

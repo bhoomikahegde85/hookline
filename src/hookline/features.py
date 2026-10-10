@@ -20,6 +20,7 @@ from . import __version__
 from .audio import AudioSeries, aggregate_audio, analyze_audio, load_wav, opening_audio
 from .config import FEATURE_VERSION, PREPROCESS_VERSION, SCHEMA_VERSION, PipelineConfig, stable_hash
 from .preprocess import PreprocessResult
+from .provenance import feature_dependencies, runtime_info
 from .segments import build_segments, overlap
 from .status import ALL_STATUSES, AVAILABLE, FAILED, MEASURED_STATUSES
 from .visual import FrameSeries, aggregate_visual, analyze_proxy, detect_cuts, opening_visual
@@ -38,7 +39,10 @@ OPENING_NOTE = "Descriptive measurements of the opening only; not an engagement 
 
 
 def feature_key(prep: PreprocessResult, cfg: PipelineConfig) -> str:
-    return stable_hash(prep.key, cfg.feature_dict())
+    """Preprocessing key (source bytes + proxy/WAV settings) + full config + the OpenCV, NumPy and
+    FFmpeg versions that compute the features: a library upgrade recomputes features (from the
+    cached proxy/WAV) instead of mixing old and new values."""
+    return stable_hash(prep.key, cfg.feature_dict(), feature_dependencies())
 
 
 def _clean(v: Any) -> Any:
@@ -191,6 +195,9 @@ def extract(prep: PreprocessResult, cfg: PipelineConfig) -> dict:
             "feature_version": FEATURE_VERSION,
             "feature_key": feature_key(prep, cfg),
             "config": cfg.to_dict(),
+            "dependencies": feature_dependencies(),
+            "preprocess_ffmpeg": prep.ffmpeg_version,  # None: proxy/WAV cache predates provenance recording
+            "runtime": runtime_info(),
         },
         "scene_cut_times": cuts,
         "warnings": warnings,

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Preprocess videos and extract timestamped low-level features. Originals are only read.
+"""Preprocess videos and extract timestamped low-level features (Task 2). Originals are only read.
+
+Run with the feature environment: .venv/bin/python scripts/run_pipeline.py ... (never .venv-models).
 
     python scripts/run_pipeline.py                         # defaults: data/raw and data/sample
     python scripts/run_pipeline.py --input path/to/dir_or_file [--input ...]
@@ -8,9 +10,10 @@
 
 Writes artifacts/cache/<video_id>/<key>/ (proxy.mp4, audio.wav, preprocess.json)
 and artifacts/features/ (per-video segments.csv, frames.csv, report.json, plus
-segments_all.csv, first5s_summary.csv, run_summary.json).
-Exit code: 0 if every video was processed (ok or partial), 1 if any failed,
-2 if FFmpeg is missing.
+segments_all.csv, first5s_summary.csv, run_summary.json, rebuilt from every video in the root;
+feature_env.json records the OpenCV/NumPy/FFmpeg that built the root's features).
+Exit code: 0 if every video of this run was processed (ok or partial), 1 if any failed,
+2 if FFmpeg is missing or an input does not exist, 3 if this is the wrong environment.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from hookline.config import PipelineConfig  # noqa: E402
 from hookline.media import find_tool  # noqa: E402
 from hookline.pipeline import default_inputs, run  # noqa: E402
+from hookline.provenance import FeatureEnvironmentError  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--window", type=float, help="segment window in seconds (default 0.5)")
     ap.add_argument("--proxy-fps", type=int, help="proxy frame rate (default 10)")
     ap.add_argument("--limit", type=int, help="process at most N videos")
+    ap.add_argument("--new-feature-env", action="store_true",
+                    help="this root's features were built with other OpenCV/NumPy/FFmpeg versions: rebuild them here")
     args = ap.parse_args(argv)
 
     if not (find_tool("ffmpeg") and find_tool("ffprobe")):
@@ -54,9 +60,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     inputs = args.input or default_inputs()
     print("inputs: " + ", ".join(str(p) for p in inputs))
-    summary = run(inputs, cfg, root=args.artifacts, force=args.force, limit=args.limit)
-    c = summary["counts"]
-    print(f"\n{c['videos']} videos: {c['ok']} ok, {c['partial']} partial, {c['failed']} failed")
+    try:
+        summary = run(inputs, cfg, root=args.artifacts, force=args.force, limit=args.limit, new_feature_env=args.new_feature_env)
+    except FeatureEnvironmentError as exc:
+        print(f"wrong environment for Task 2 features: {exc}", file=sys.stderr)
+        return 3
+    c, total = summary["last_run"]["counts"], summary["counts"]
+    print(f"\n{c['videos']} videos: {c['ok']} ok, {c['partial']} partial, {c['failed']} failed"
+          f" (artifacts root now holds {total['videos']} videos)")
     print(f"outputs: {Path(summary['artifacts_root']) / 'features'}")
     return 1 if c["failed"] else 0
 

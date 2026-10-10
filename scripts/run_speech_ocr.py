@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Timestamped speech (Whisper), on-screen text (PaddleOCR), librosa audio features and, if
-enabled, a Gemini interpretation on top of the cached features; then the merged evidence
-timeline and evidence-linked edit recommendations.
+"""Timestamped speech (Whisper), on-screen text (PaddleOCR) and librosa audio features on top of the
+cached features; then the merged evidence timeline and rule-based edit observations.
 
     python scripts/run_speech_ocr.py --download-models            # first run: fetch models
     python scripts/run_speech_ocr.py --input path/to/dir_or_file  # repeatable; default data/raw + data/sample
     python scripts/run_speech_ocr.py --skip-ocr --asr-model base
     python scripts/run_speech_ocr.py --skip-speech --ocr-fps 1 --ocr-max-seconds 10
     python scripts/run_speech_ocr.py --input 01-Hookline --artifacts artifacts/company --limit 5
-    python scripts/run_speech_ocr.py --input data/sample/syn_av_testpattern_8s.mp4 --gemini offline
-    python scripts/run_speech_ocr.py --input my_clip.mp4 --gemini remote --gemini-allow-remote   # uploads my_clip.mp4
     python scripts/run_speech_ocr.py --input data/sample/syn_av_testpattern_8s.mp4 --siglip --download-models  # first SigLIP run (~1.5 GB)
 
-Gemini is off by default. "offline" never uses the network. "remote" uploads the video to the
-Gemini API and needs --gemini-allow-remote plus GEMINI_API_KEY (environment or untracked .env);
-company videos under 01-Hookline/ additionally need --gemini-approve <video_id>.
+TRIBE v2 (--tribe or ENABLE_TRIBE=true, off by default) sends the video to your own Hugging Face
+Inference Endpoint (TRIBE_ENDPOINT_URL, HF_TOKEN; see docs/tribe.md) and stores its predicted brain
+responses in tribe.json + tribe_preds.npy. Uploading needs --tribe-allow-remote, and company videos
+also need --tribe-approve <video_id>. Nothing runs locally.
 
 Needs requirements-models.txt, installed in a separate venv (.venv-models; see README).
+Task 2 features must already exist (built by .venv/bin/python scripts/run_pipeline.py with the
+same --artifacts/--window/--proxy-fps); this script only reads them and never computes them.
 Run it as .venv-models/bin/python scripts/run_speech_ocr.py. Models are never downloaded unless
 --download-models is given. Preprocessing/features are reused from the cache
 (computed first if missing): pass the same --window/--proxy-fps as run_pipeline.py.
-Writes artifacts/features/<video_id>/{speech.json, ocr.json, librosa.json, gemini.json (if enabled),
+Writes artifacts/features/<video_id>/{speech.json, ocr.json, librosa.json,
 segments_merged.csv, words.csv, text_observations.csv, opening_multimodal.json, recommendations.json}
 and run-level segments_merged_all.csv,
 first5s_multimodal.csv, speech_ocr_run_summary.json.
@@ -37,9 +37,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from hookline.config import GeminiConfig, LibrosaConfig, OcrConfig, PipelineConfig, SiglipConfig, SpeechConfig  # noqa: E402
+from hookline.config import (  # noqa: E402
+    LibrosaConfig, OcrConfig, PipelineConfig, SiglipConfig, SpeechConfig, TribeConfig,
+)
 from hookline.context import LazyBackend  # noqa: E402
-from hookline.gemini import default_model  # noqa: E402
 from hookline.media import find_tool  # noqa: E402
 from hookline.multimodal import Backends, run_multimodal  # noqa: E402
 from hookline.ocr import PaddleOcrReader  # noqa: E402
@@ -82,21 +83,27 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--siglip-fps", type=float, default=SiglipConfig.sample_fps, help="proxy frames per second to embed")
     v.add_argument("--siglip-device", choices=["auto", "mps", "cpu"], default=SiglipConfig.device)
     v.add_argument("--siglip-batch-size", type=int, default=SiglipConfig.batch_size)
-    m = ap.add_argument_group("Gemini interpretation (off by default)")
-    m.add_argument("--gemini", choices=["off", "offline", "remote"], default="off",
-                   help="off; offline = no network (validates --gemini-offline-response or an empty skeleton); remote = upload")
-    m.add_argument("--gemini-model", default=None, help="model id (default: $GEMINI_MODEL or %s)" % GeminiConfig.model)
-    m.add_argument("--gemini-allow-remote", action="store_true", help="required to upload any video in remote mode")
-    m.add_argument("--gemini-approve", action="append", default=[], metavar="VIDEO_ID",
+    r = ap.add_argument_group("TRIBE v2 brain-response predictions on a remote endpoint (off by default)")
+    r.add_argument("--tribe", action="store_true", help="enable TRIBE v2 (same as ENABLE_TRIBE=true)")
+    r.add_argument("--tribe-allow-remote", action="store_true", help="required to upload any video to the endpoint")
+    r.add_argument("--tribe-approve", action="append", default=[], metavar="VIDEO_ID",
                    help="allow uploading this company video (under 01-Hookline/); repeatable")
-    m.add_argument("--gemini-timeout", type=float, default=GeminiConfig.timeout_s, help="seconds per API request")
-    m.add_argument("--gemini-max-retries", type=int, default=GeminiConfig.max_retries)
-    m.add_argument("--gemini-fps", type=float, default=GeminiConfig.fps, help="frames per second Gemini samples")
-    m.add_argument("--gemini-media-resolution", choices=["low", "medium", "high"], default=GeminiConfig.media_resolution)
-    m.add_argument("--gemini-offline-response", type=Path, help="offline mode: JSON response to validate instead of calling the API")
+    r.add_argument("--tribe-language", default=TribeConfig.language,
+                   help="transcription language for TRIBE v2's whisperX step: english (default), french, spanish, dutch, chinese")
+    r.add_argument("--tribe-timeout", type=float, default=TribeConfig.timeout_s, help="seconds per endpoint request")
+    r.add_argument("--tribe-api", choices=["endpoint", "job"], default=TribeConfig.api,
+                   help="endpoint: one synchronous request (Inference Endpoint); job: POST /analyze then poll /report/<id> (Space)")
+    r.add_argument("--tribe-job-wait", type=float, default=TribeConfig.job_wait_s, help="job API: seconds to wait for the report")
     args = ap.parse_args(argv)
+    try:
+        tribe_cfg = TribeConfig.from_env(enabled=True if args.tribe else None, allow_remote=args.tribe_allow_remote or None,
+                                         approved_ids=tuple(args.tribe_approve), language=args.tribe_language,
+                                         timeout_s=args.tribe_timeout, api=args.tribe_api, job_wait_s=args.tribe_job_wait)
+    except ValueError as exc:
+        ap.error(str(exc))
 
-    if args.skip_speech and args.skip_ocr and args.skip_librosa and args.gemini == "off" and not args.siglip:
+    if (args.skip_speech and args.skip_ocr and args.skip_librosa and not args.siglip
+            and not tribe_cfg.enabled):
         ap.error("nothing to do: every stage skipped")
     if not (find_tool("ffmpeg") and find_tool("ffprobe")):
         print("ffmpeg and ffprobe are required (macOS: brew install ffmpeg; Ubuntu: sudo apt install ffmpeg)", file=sys.stderr)
@@ -123,20 +130,9 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(str(exc))
 
     try:
-        gemini_cfg = GeminiConfig(
-            mode=args.gemini, model=args.gemini_model or default_model(), allow_remote=args.gemini_allow_remote,
-            approved_ids=tuple(args.gemini_approve), timeout_s=args.gemini_timeout, max_retries=args.gemini_max_retries,
-            fps=args.gemini_fps, media_resolution=args.gemini_media_resolution,
-            offline_response=str(args.gemini_offline_response) if args.gemini_offline_response else None,
-        )
-    except ValueError as exc:
-        ap.error(str(exc))
-    try:
         siglip_cfg = SiglipConfig(sample_fps=args.siglip_fps, device=args.siglip_device, batch_size=args.siglip_batch_size)
     except ValueError as exc:
         ap.error(str(exc))
-    if args.gemini == "remote" and not args.gemini_allow_remote:
-        print("gemini: remote mode without --gemini-allow-remote: nothing will be uploaded", file=sys.stderr)
 
     backends = Backends(
         speech=None if args.skip_speech else LazyBackend(lambda: FasterWhisperTranscriber(speech_cfg, args.download_models)),
@@ -152,19 +148,19 @@ def main(argv: list[str] | None = None) -> int:
     summary = run_multimodal(
         inputs, args.artifacts, cfg, speech_cfg, ocr_cfg, backends,
         run_speech=not args.skip_speech, run_ocr=not args.skip_ocr, force=args.force, limit=args.limit,
-        librosa_cfg=LibrosaConfig(), gemini_cfg=gemini_cfg, run_librosa=not args.skip_librosa,
-        siglip_cfg=siglip_cfg, run_siglip=args.siglip,
+        librosa_cfg=LibrosaConfig(), run_librosa=not args.skip_librosa,
+        siglip_cfg=siglip_cfg, run_siglip=args.siglip, tribe_cfg=tribe_cfg,
     )
-    c = summary["counts"]
-    print(f"\n{c['videos']} videos: {c['ok']} ok, {c['partial']} partial, {c['failed']} failed")
+    last = summary["last_run"]
+    c, total = last["counts"], summary["counts"]
+    print(f"\n{c['videos']} videos: {c['ok']} ok, {c['partial']} partial, {c['failed']} failed"
+          f" (artifacts root now holds {total['videos']} videos)")
     for name, backend in (("speech", backends.speech), ("ocr", backends.ocr), ("siglip", backends.siglip)):
         if backend is not None and backend.error:
             print(f"{name} model unavailable: {backend.error}")
-    if args.gemini != "off":
-        tokens = summary.get("gemini_tokens")
-        print(f"gemini ({args.gemini}): {summary['gemini_api_calls']} API calls"
-              + (f", {tokens} tokens reported by the API" if tokens else ", token usage unavailable")
-              + "; cost not computed (the API returns token counts, not prices)")
+    if tribe_cfg.enabled:
+        print(f"tribe: {last['tribe_requests_sent']} video(s) sent to the endpoint"
+              + ("" if tribe_cfg.allow_remote else " (--tribe-allow-remote not given: nothing uploaded)"))
     print(f"outputs: {Path(summary['artifacts_root']) / 'features'}")
     return 1 if c["failed"] else 0
 

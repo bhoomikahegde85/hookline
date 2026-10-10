@@ -18,6 +18,6 @@ faster-whisper>=1.1          # CTranslate2 Whisper; CPU int8 on Apple Silicon, C
 paddleocr>=3.0,<3.8          # PP-OCRv5 pipeline; brings paddlex and opencv-contrib-python (provides cv2)
 paddlepaddle>=3.0            # CPU build (~100 MB); on a CUDA machine install paddlepaddle-gpu instead
 librosa>=0.11,<0.12          # librosa audio features (librosa.json); pulls scipy, numba, soundfile
-google-genai>=2.29,<3        # Gemini interpretation (gemini.json); only used with --gemini remote
 torch==2.14.1                # SigLIP 2 (--siglip); MPS on Apple Silicon, ~555 MB installed
 transformers==5.19.0         # SigLIP 2 model/processor; weights (~1.5 GB) fetched on first --siglip --download-models
+google-genai>=2.29,<3        # Gemini segment interpretation (scripts/run_gemini_edit.py); uploads the video to Google, opt-in only

@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from hookline.config import GeminiConfig, OcrConfig, PipelineConfig, SiglipConfig, SpeechConfig
+from hookline.config import OcrConfig, PipelineConfig, SiglipConfig, SpeechConfig
 from hookline.context import BackendUnavailable, LazyBackend
 from hookline.features import SEGMENT_COLUMNS
 from hookline.multimodal import (
@@ -27,7 +27,7 @@ from hookline.multimodal import (
 )
 from hookline.ocr import OBSERVATION_COLUMNS
 from hookline.speech import WORD_COLUMNS
-from hookline.pipeline import VideoInput
+from hookline.pipeline import VideoInput, discover, process_video
 
 pytestmark = pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="FFmpeg not installed")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -110,7 +110,14 @@ def make_backends(asr=None, ocr=None):
     return Backends(LazyBackend(lambda: asr), LazyBackend(lambda: ocr)), asr, ocr
 
 
+def build_features(inputs: list[Path], root: Path) -> None:
+    """Task 2 first, as run_pipeline.py does: the model stage only reads features."""
+    for item in discover(inputs):
+        process_video(item, CFG, root)
+
+
 def run_one(clip: Path, root: Path, backends: Backends, **kw) -> dict:
+    build_features([clip], root)
     return process_video_multimodal(VideoInput(clip.stem, clip), root, CFG, kw.pop("speech_cfg", SCFG),
                                     kw.pop("ocr_cfg", OCFG), backends, **kw)
 
@@ -249,11 +256,11 @@ def test_caching_config_changes_and_failure_retry(clips, tmp_path) -> None:
     before = sha(clip)
     backends, asr, ocr = make_backends()
     first = run_one(clip, tmp_path, backends)
-    assert first["cache"] == {"features": False, "speech": False, "ocr": False, "librosa": False, "gemini": None}
+    assert first["cache"] == {"features": True, "speech": False, "ocr": False, "librosa": False}
     report_bytes = (tmp_path / "features" / "talk" / "report.json").read_bytes()
 
     second = run_one(clip, tmp_path, backends)
-    assert second["cache"] == {"features": True, "speech": True, "ocr": True, "librosa": True, "gemini": None}
+    assert second["cache"] == {"features": True, "speech": True, "ocr": True, "librosa": True}
     assert (asr.calls, ocr.calls) == (1, 8)
     assert (tmp_path / "features" / "talk" / "report.json").read_bytes() == report_bytes  # features untouched
 
@@ -291,6 +298,7 @@ def test_batch_run_writes_run_outputs_and_never_touches_inputs(clips, tmp_path) 
     before = {p.name: sha(p) for p in inputs.iterdir()}
     backends, _, _ = make_backends()
     logs: list[str] = []
+    build_features([inputs], tmp_path / "artifacts")
     summary = run_multimodal([inputs], tmp_path / "artifacts", CFG, SCFG, OCFG, backends, log=logs.append)
     assert summary["counts"] == {"videos": 4, "ok": 3, "partial": 0, "failed": 1}
     assert len(logs) == 4 and any("zero_bytes: failed" in line for line in logs)
@@ -305,7 +313,7 @@ def test_batch_run_writes_run_outputs_and_never_touches_inputs(clips, tmp_path) 
     talk = next(r for r in opening if r["video_id"] == "talk")
     assert talk["speech_detected"] == "true" and talk["texts"] == "TEXT ON SCREEN"
     run = json.loads((feats / "speech_ocr_run_summary.json").read_text())
-    assert run["config"]["speech"]["model"] == "small" and len(run["videos"]) == 4
+    assert run["last_run"]["config"]["speech"]["model"] == "small" and len(run["videos"]) == 4
     assert {p.name: sha(p) for p in inputs.iterdir()} == before  # nothing written next to the originals
     assert not (tmp_path / "artifacts" / "cache" / "_ocr_tmp").exists() or not any(
         (tmp_path / "artifacts" / "cache" / "_ocr_tmp").iterdir())
@@ -318,6 +326,7 @@ def test_cli_without_models_installed_fails_gracefully(clips, tmp_path, monkeypa
     inputs.mkdir()
     for name in ("talk", "silent_video"):
         shutil.copy(clips[name], inputs / f"{name}.mp4")
+    build_features([inputs], tmp_path / "artifacts")
     spec = importlib.util.spec_from_file_location("run_speech_ocr", PROJECT_ROOT / "scripts" / "run_speech_ocr.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -332,86 +341,36 @@ def test_cli_without_models_installed_fails_gracefully(clips, tmp_path, monkeypa
     assert by_id["silent_video"]["status"] == "partial" and by_id["silent_video"]["speech_status"] == "absent"
 
 
-GEMINI_RESPONSE = {
-    "video_summary": "Grey frame with a white box and a steady tone.",
-    "opening_hook": {"assessment": "Plain opening.", "evidence": [
-        {"start_s": 0.0, "end_s": 1.0, "kind": "observation", "modality": "visual", "description": "grey frame",
-         "confidence": 0.9}]},
-    "narrative_progression": "None.", "pacing": "Static.",
-    "moments": [{"start_s": 1.0, "end_s": 2.4, "kind": "observation", "modality": "visual", "category": "visual_change",
-                 "description": "a white box appears", "confidence": 0.9}],
-    "strengths": [], "weaknesses": [],
-    "edit_suggestions": [{"start_s": 0.0, "end_s": 1.0, "action": "Show the box earlier.", "rationale": "Nothing changes.",
-                          "expected_effect": "The change arrives sooner.", "confidence": 0.4, "evidence_moment_indices": [0]}],
-    "uncertainties": [],
-}
-
-
-class FakeGemini:
-    def __init__(self, responses=None):
-        self.calls, self.responses = 0, list(responses or [])
-
-    def analyse(self, video_path, prompt, schema, cfg):
-        self.calls += 1
-        r = self.responses.pop(0) if self.responses else GEMINI_RESPONSE
-        if isinstance(r, Exception):
-            raise r
-        return json.dumps(r), {"total_token_count": 1000}
-
-
-def test_librosa_gemini_and_recommendations_join_the_timeline(clips, tmp_path, monkeypatch) -> None:
+def test_librosa_and_rule_based_recommendations_join_the_timeline(clips, tmp_path) -> None:
     pytest.importorskip("librosa")
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
     clip = clips["talk"]
     before = sha(clip)
     backends, _, _ = make_backends()
-    fake = FakeGemini()
-    backends.gemini = lambda: fake
-    gcfg = GeminiConfig(mode="remote", allow_remote=True)
-    first = run_one(clip, tmp_path, backends, gemini_cfg=gcfg)
+    first = run_one(clip, tmp_path, backends)
     out = tmp_path / "features" / "talk"
-    assert fake.calls == 1 and first["cache"]["gemini"] is False and first["cache"]["librosa"] is False
-    assert first["librosa"]["status"] == "available" and first["gemini"]["status"] == "available"
+    assert first["cache"]["librosa"] is False and first["librosa"]["status"] == "available"
+    scores = json.loads((out / "scores.json").read_text())
+    assert scores["basis"] == "measured_only" and scores["scoring_version"] == "2" and "not retention" in scores["note"]
+    assert read_csv(out / "segment_scores.csv")[0]["basis"] == "measured_only"
+    assert all(c["source"] in ("rule", "measured") for sg in scores["segments"]
+               for c in sg["risk_contributions"] + sg["quality_contributions"])
 
     rows = read_csv(out / "segments_merged.csv")
-    assert list(rows[0]) == MERGED_COLUMNS
+    assert list(rows[0]) == MERGED_COLUMNS and not any("gemini" in c for c in MERGED_COLUMNS)
     assert {r["librosa_status"] for r in rows} == {"available"} and all(r["librosa_rms_db"] for r in rows)
     assert float(rows[0]["librosa_centroid_hz"]) == pytest.approx(300, rel=0.1)  # 300 Hz sine
-    by_start = {float(r["start_s"]): r for r in rows}
-    assert by_start[1.5]["gemini_moment_ids"] == "m0" and by_start[3.0]["gemini_moment_ids"] == ""
     recs = json.loads((out / "recommendations.json").read_text())
-    assert recs["evidence_problems"] == [] and recs["inputs"]["gemini"] == "available"
-    gem_recs = [r for r in recs["recommendations"] if r["source"] == "gemini"]
-    assert len(gem_recs) == 1 and {"type": "gemini_moment", "id": "m0"} in gem_recs[0]["evidence"]
-    assert gem_recs[0]["id"] in by_start[0.0]["recommendation_ids"].split("|")
+    assert recs["evidence_problems"] == [] and "gemini" not in recs["inputs"]
+    assert all(r["source"] == "rule" and r["basis"] == "measured" for r in recs["recommendations"])
+    assert not (out / "gemini.json").exists()
     words = read_csv(out / "words.csv")
-    assert [w["word"] for w in words] == ["hey", "look", "this"]  # Whisper words untouched by Gemini
+    assert [w["word"] for w in words] == ["hey", "look", "this"]
 
-    second = run_one(clip, tmp_path, backends, gemini_cfg=gcfg)
-    assert fake.calls == 1 and second["cache"]["gemini"] is True and second["cache"]["librosa"] is True
-    third = run_one(clip, tmp_path, backends, gemini_cfg=replace(gcfg, model="another-model"))
-    assert fake.calls == 2 and third["cache"]["gemini"] is False
-    good = (out / "gemini.json").read_bytes()
-
-    class Err(Exception):
-        code = 400
-
-    backends.gemini = lambda: FakeGemini([Err("bad request")])
-    failed = run_one(clip, tmp_path, backends, gemini_cfg=replace(gcfg, model="third-model"))
-    assert failed["gemini"]["status"] == "failed" and failed["cache"]["gemini_written"] is False
-    assert (out / "gemini.json").read_bytes() == good  # a failure never overwrites a usable result
-    assert {r["gemini_status"] for r in read_csv(out / "segments_merged.csv")} == {"failed"}
-    assert failed["status"] == "partial"
+    second = run_one(clip, tmp_path, backends)
+    assert second["cache"]["librosa"] is True
+    from hookline.multimodal import _log_line, _record
+    assert "gemini" not in _log_line(1, 1, _record(second)).lower()
     assert sha(clip) == before
-
-
-def test_gemini_off_by_default_and_never_called(clips, tmp_path) -> None:
-    backends, _, _ = make_backends()
-    backends.gemini = lambda: pytest.fail("Gemini transport created while disabled")
-    res = run_one(clips["talk"], tmp_path, backends)
-    assert res["gemini"] is None and not (tmp_path / "features" / "talk" / "gemini.json").exists()
-    rows = read_csv(tmp_path / "features" / "talk" / "segments_merged.csv")
-    assert {r["gemini_status"] for r in rows} == {"uncertain"} and "gemini=not run (disabled)" in rows[0]["notes"]
 
 
 class FakeSiglip:

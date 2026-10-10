@@ -5,7 +5,11 @@ Whisper times are relative to the WAV start and are shifted by the audio offset
 from the timestamp map, so every time here is on the project timeline
 (seconds from the start of the original's playback).
 
-File-level status (``speech.json -> status``):
+File-level status (``speech.json -> status``) and the plain-language ``speech_result``:
+- ``speech_result``: ``speech`` (at least one confident segment), ``no_speech`` (measured,
+  nothing transcribed, or silent audio), ``uncertain_speech`` (transcribed, but every segment
+  is flagged), ``failed`` (could not be measured), ``absent`` (no audio stream) or
+  ``unknown`` (stream presence unknown). Flagged words are kept, never deleted.
 - ``absent``: the file has no audio stream, so there is nothing to hear.
 - ``uncertain``: audio presence unknown (inspection failed), or every
   transcribed segment is flagged as low confidence.
@@ -116,15 +120,44 @@ def _silent_throughout(samples: np.ndarray, sr: int, silence_dbfs: float) -> boo
 
 
 def _flags(seg: dict, cfg: SpeechConfig) -> list[str]:
+    """Per-segment warning flags (the segment and its words are kept either way):
+    - ``low_confidence``: avg log-probability below ``low_logprob``
+    - ``possible_non_speech``: low confidence and Whisper's no-speech probability is high
+    - ``high_no_speech_prob``: Whisper's own no-speech probability is high although the decoder
+      was confident enough to keep the text (typical of words hallucinated over music)
+    - ``low_word_probability``: the segment's words have mean probability below ``low_word_probability``
+    - ``repetitive``: compression ratio above ``high_compression_ratio`` (repetition loops)"""
     flags = []
     lp, nsp, cr = seg.get("avg_logprob"), seg.get("no_speech_prob"), seg.get("compression_ratio")
-    if lp is not None and lp < cfg.low_logprob:
+    low_lp = lp is not None and lp < cfg.low_logprob
+    high_nsp = nsp is not None and nsp > cfg.high_no_speech_prob
+    if low_lp:
         flags.append("low_confidence")
-        if nsp is not None and nsp > cfg.high_no_speech_prob:
+        if high_nsp:
             flags.append("possible_non_speech")
+    elif high_nsp:
+        flags.append("high_no_speech_prob")
+    probs = [w.get("probability") for w in seg.get("words") or [] if w.get("probability") is not None]
+    if probs and sum(probs) / len(probs) < cfg.low_word_probability:
+        flags.append("low_word_probability")
     if cr is not None and cr > cfg.high_compression_ratio:
         flags.append("repetitive")
     return flags
+
+
+def speech_result(art: dict) -> str:
+    """Plain-language outcome; keeps "no speech", "uncertain" and "failed" apart."""
+    if art["status"] == ABSENT:
+        return "absent"
+    if art["status"] == FAILED:
+        return "failed"
+    if not art.get("measured"):
+        return "unknown"
+    if art.get("speech_detected") is True:
+        return "speech"
+    if art.get("speech_detected") is False:
+        return "no_speech"
+    return "uncertain_speech"
 
 
 def _shift(t: float | None, offset: float, duration: float | None) -> float | None:
@@ -178,6 +211,8 @@ def _base(ctx: MediaContext, cfg: SpeechConfig, key: str) -> dict[str, Any]:
         "status": FAILED,
         "measured": False,
         "speech_detected": None,
+        "speech_result": None,
+        "flags": [],
         "method": None,
         "reason": None,
         "language": None,
@@ -196,6 +231,12 @@ def _base(ctx: MediaContext, cfg: SpeechConfig, key: str) -> dict[str, Any]:
 
 def extract_speech(ctx: MediaContext, cfg: SpeechConfig, backend: LazyBackend | None) -> dict:
     """Transcribe one video's cached WAV. The model is only loaded if transcription is needed."""
+    art = _extract_speech(ctx, cfg, backend)
+    art["speech_result"] = speech_result(art)
+    return art
+
+
+def _extract_speech(ctx: MediaContext, cfg: SpeechConfig, backend: LazyBackend | None) -> dict:
     art = _base(ctx, cfg, speech_key(ctx, cfg))
     if ctx.audio_stream != AVAILABLE:
         art["status"] = ctx.audio_stream
@@ -257,6 +298,11 @@ def extract_speech(ctx: MediaContext, cfg: SpeechConfig, backend: LazyBackend | 
         art["warnings"].append(art["reason"])
     elif any(s["flags"] for s in segs):
         art["warnings"].append(f"{sum(1 for s in segs if s['flags'])} of {len(segs)} segments flagged low confidence")
+    lang_p = art["language_probability"]
+    if segs and cfg.language is None and lang_p is not None and lang_p < cfg.low_language_probability:
+        art["flags"].append("low_language_confidence")
+        art["warnings"].append(f"detected language {art['language']!r} with probability {lang_p:g}; the transcript may be "
+                               "in the wrong script or hallucinated (force one with --language)")
     if has_words is False:
         art["warnings"].append("backend returned no word timestamps; segment times used for coverage")
     art["timing"] = {

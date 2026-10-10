@@ -7,8 +7,10 @@ on-screen text) and gives format-aware edit suggestions.
 
 Design rules:
 - A missing modality is never negative evidence.
-- Hookline never claims to predict second-by-second retention without real
-  timestamped retention labels.
+- Hookline's own scores never claim to predict retention. The only retention
+  curve is TTCC's: a pretrained model's prediction, labelled as such, kept separate
+  from the heuristics, and not validated on these reels (there are no retention
+  labels for them).
 
 **Status: Phase 1, Task 3.** Task 1 set up the project foundation, the dataset
 inspection tools and the test fixtures. Task 2 adds cached preprocessing
@@ -36,10 +38,13 @@ hookline/
 │   ├── fetch_snapugc_subset.py
 │   ├── run_pipeline.py          preprocess + extract features
 │   ├── run_speech_ocr.py        speech + on-screen text on top of the cached features
+│   ├── run_ttcc.py              TTCC predicted retention for named videos + video_report.md (opt-in)
+│   ├── ttcc_infer.py            TTCC runner; runs only in the TTCC environment (docs/ttcc.md)
 │   └── show_features.py         readable view of one video's features
 ├── src/hookline/   probing, manifests, preprocess, segments, visual, audio, features, pipeline,
-│                   speech, ocr, multimodal (Task 3 orchestration), context
+│                   speech, ocr, multimodal (Task 3 orchestration), context, ttcc, video_report
 ├── requirements-models.txt      optional: faster-whisper + PaddleOCR (Task 3)
+├── requirements-ttcc.txt        optional: TTCC inference, in its own GPU environment
 └── tests/
 ```
 
@@ -86,20 +91,16 @@ packages or models, the stage still runs and records `failed` with the
 reason. It never reports "no speech" or "no text" in that case.
 
 The same venv also runs the librosa audio features (`librosa.json`, on by default,
-`--skip-librosa` to skip) and the optional Gemini interpretation (`gemini.json`, off by
-default). For Gemini, copy `.env.example` to `.env` (git-ignored) and set `GEMINI_API_KEY`,
-and optionally `GEMINI_MODEL` (default `gemini-3.8-flash`). The key is never printed or stored.
-Remote mode uploads the video to Google: it needs `--gemini-allow-remote`, and company reels
-under `01-Hookline/` also need `--gemini-approve <video_id>` (ask the organisers first; see
-below). `--gemini offline` makes no network calls.
+`--skip-librosa` to skip). Edit observations (`recommendations.json`) and the heuristic scores
+are computed from the measured features with fixed rules; no language model or paid API is involved.
 
 `--siglip` (off by default) adds SigLIP 2 frame embeddings and description scores
 (`google/siglip2-base-patch16-224`, pinned revision). It needs `torch` + `transformers` from
 `requirements-models.txt` (about 555 MB installed). The first run needs `--download-models`
 to fetch about 1.5 GB into `~/.cache/huggingface`. No Hugging Face token is needed for this
 public model. If you want one anyway (it raises download rate limits), run
-`.venv-models/bin/hf auth login` or `export HF_TOKEN=...`. Putting it in `.env` has no effect,
-because `.env` is only read for the Gemini settings. The model runs on MPS (Apple GPU) when
+`.venv-models/bin/hf auth login` or `export HF_TOKEN=...`. For SigLIP, `HF_TOKEN` in `.env` has no
+effect: `.env` is read only for the TRIBE endpoint (`TRIBE_ENDPOINT_URL`, `HF_TOKEN`). The model runs on MPS (Apple GPU) when
 available, else CPU.
 
 ## Commands
@@ -138,11 +139,9 @@ python scripts/run_speech_ocr.py --skip-speech --ocr-fps 1 --ocr-max-seconds 10
 python scripts/run_speech_ocr.py --language hi --ocr-lang hi     # force Hindi ASR, Devanagari OCR
 # Estimate OCR sampling misses: compare a 1 fps run against a denser reference run (e.g. --ocr-fps 4 into another root)
 python scripts/compare_ocr_runs.py --ref artifacts/company_ocr_ref --test artifacts/company FC003 FL004 FL019
-# Librosa features + Gemini without the network (validates a local JSON instead of calling the API)
-python scripts/run_speech_ocr.py --input data/sample/syn_av_testpattern_8s.mp4 --gemini offline \
-    --gemini-offline-response path/to/response.json
-# Gemini for real on your own clip (uploads it; needs GEMINI_API_KEY); results are cached per model/prompt version
-python scripts/run_speech_ocr.py --input my_clip.mp4 --gemini remote --gemini-allow-remote --gemini-timeout 120
+# One company reel end to end on this machine (features first, then the model stage; nothing is uploaded)
+.venv/bin/python scripts/run_pipeline.py --input 01-Hookline/face/videos/FC001.mp4 --artifacts artifacts/demo
+.venv-models/bin/python scripts/run_speech_ocr.py --input 01-Hookline/face/videos/FC001.mp4 --artifacts artifacts/demo --ocr-fps 1 --siglip
 # SigLIP 2 visual-semantic signals (first run downloads ~1.5 GB; later runs read the local cache)
 python scripts/run_speech_ocr.py --input data/sample/syn_av_testpattern_8s.mp4 --siglip --download-models
 # Rebuild one reel's evidence timeline from cached speech/OCR (same flags as the original run; no model inference)
@@ -159,6 +158,52 @@ models aren't installed, since every video's speech/text is then `failed`.
 Pass the same `--window` / `--proxy-fps` to both scripts so the features cache
 is shared.
 
+Order matters: Task 2 features come only from `.venv/bin/python scripts/run_pipeline.py`. It
+refuses `.venv-models` (exit 3) and refuses to mix library versions within one artifacts root
+(`feature_env.json`). `run_speech_ocr.py` only reads those features; a video without them is
+reported `failed` with the command to run. Run-level CSVs and summaries are rebuilt from every
+video in the root, so re-running one video never drops the others.
+
+## TTCC predicted retention (opt-in)
+
+`scripts/run_ttcc.py` runs the pretrained TTCC model
+(`liangyuch/ttcc-sft-qwen25omni-3b-v8`, pinned revision) on videos you name with `--input`, and
+writes a per-video `video_report.md`. That report keeps four things in separate sections:
+measured features, heuristic scores, TTCC-predicted retention and the edit recommendations.
+
+- TTCC is off unless you set `ENABLE_TTCC=true` or pass `--enable-ttcc`.
+- It needs its own environment (`.venv-ttcc`: `requirements-ttcc.txt` plus the upstream `go_viral`
+  checkout). It runs on this Mac (Apple GPU via MPS, or CPU) as well as on CUDA GPUs; the device is
+  detected. Setup, the verified inference protocol, the differences from the upstream GPU setup and
+  the limitations are in [docs/ttcc.md](docs/ttcc.md).
+- With TTCC off, the script only rewrites the reports.
+
+```bash
+.venv/bin/python scripts/run_ttcc.py --input 01-Hookline/face/videos/FC001.mp4 --artifacts artifacts/company             # report only
+.venv/bin/python scripts/run_ttcc.py --input 01-Hookline/face/videos/FC001.mp4 --artifacts artifacts/company --enable-ttcc
+```
+
+## TRIBE v2 brain-response predictions (opt-in, remote)
+
+`run_speech_ocr.py --tribe` sends a video to **your own Hugging Face Inference Endpoint** running
+TRIBE v2 (`facebook/tribev2`, CC BY-NC 4.0, non-commercial only). It stores the model's predicted
+fMRI responses (an average subject on the fsaverage5 cortex, at 1 s steps) in `tribe.json` and
+`tribe_preds.npy`.
+
+- TRIBE is off by default. Nothing runs locally.
+- The endpoint URL and token come from `TRIBE_ENDPOINT_URL` and `HF_TOKEN` (environment or the
+  untracked `.env`).
+- Uploading needs `--tribe-allow-remote`. Company reels also need `--tribe-approve <video_id>`.
+- These outputs are not retention or engagement predictions.
+- The endpoint handler is in `endpoint/tribev2/`. Deployment steps, licences and status are in
+  [docs/tribe.md](docs/tribe.md).
+
+### TTCC drop-off analysis
+
+`scripts/show_dropoffs.py <video_id> --artifacts <root>` prints, second by second, where TTCC's predicted retention falls and what was
+measured at that moment (words, text, cuts, quiet audio), with unvalidated rule-based candidate causes. It reads saved files only. See
+[docs/ttcc.md](docs/ttcc.md).
+
 ## Feature outputs
 
 | File | Contents |
@@ -167,8 +212,9 @@ is shared.
 | `artifacts/features/<video_id>/frames.csv` | per proxy frame (10 fps) visual measurements and cut flags |
 | `artifacts/features/<video_id>/report.json` | provenance, probe, timestamp map, config + versions, warnings/errors, opening summary, segments |
 | `artifacts/features/first5s_summary.csv` | one row per video: valid windows and status coverage per modality in the first 5 s (or the whole clip if shorter) |
-| `artifacts/features/segments_all.csv` | all segment rows from the last run |
-| `artifacts/features/run_summary.json` | per-video ok / partial / failed and counts |
+| `artifacts/features/segments_all.csv` | all segment rows of every video in the artifacts root (rebuilt each run) |
+| `artifacts/features/run_summary.json` | per-video ok / partial / failed for every video in the root, plus `last_run` |
+| `artifacts/features/feature_env.json` | OpenCV / NumPy / FFmpeg / Python that built this root's features |
 | `artifacts/features/<video_id>/speech.json` | language, Whisper segments and words with timestamps, confidence flags, status and reason |
 | `artifacts/features/<video_id>/ocr.json` | sampled frame times, deduplicated text events (first/last seen, box, repeats), per-frame detections, status |
 | `artifacts/features/<video_id>/segments_merged.csv` | evidence timeline: every `segments.csv` column plus speech and text columns per segment, with `text_evidence` (observed/inferred) and links into `words.csv` / `text_observations.csv` |
@@ -176,10 +222,13 @@ is shared.
 | `artifacts/features/<video_id>/text_observations.csv` | one row per OCR detection/sample: sample time, box, event id, segment, failed samples |
 | `artifacts/features/<video_id>/opening_multimodal.json` | first 5 s: visual, audio, speech (first word, transcript, words/s) and text (first text, events) |
 | `artifacts/features/<video_id>/librosa.json` | librosa per-segment audio features, low-energy intervals, global tempo (when reliable) |
-| `artifacts/features/<video_id>/gemini.json` | Gemini interpretation (opt-in): moments, hook, strengths/weaknesses, edit suggestions with timestamps; validation issues, token usage |
 | `artifacts/features/<video_id>/siglip.json`, `siglip_embeddings.npy` | SigLIP 2 (opt-in): sampled frame times/ids, description scores, frame-to-frame change; float16 embeddings |
-| `artifacts/features/<video_id>/recommendations.json` | rule-based and Gemini edit suggestions, each with interval, evidence ids and reason |
-| `artifacts/features/segments_merged_all.csv`, `first5s_multimodal.csv`, `speech_ocr_run_summary.json` | run-level versions of the above (videos of the last run only) |
+| `artifacts/features/<video_id>/scores.json`, `segment_scores.csv` | per-segment `attention_risk` and `moment_quality` (0–100 heuristics) with every point's source; top spans |
+| `artifacts/features/<video_id>/recommendations.json` | rule-based edit observations, each with interval, evidence ids and reason |
+| `artifacts/features/<video_id>/ttcc_status.json`, `ttcc_retention.json`, `ttcc_raw.json`, `ttcc_retention.svg` | TTCC (opt-in): latest attempt status; predicted R(t) at 1 s steps with provenance; raw 60-value head output; plot. See [docs/ttcc.md](docs/ttcc.md) |
+| `artifacts/features/<video_id>/tribe.json`, `tribe_preds.npy` | TRIBE v2 (opt-in, remote endpoint): status, provenance, segment timestamps; float32 predicted brain responses (n_segments × 20484 fsaverage5 vertices). See [docs/tribe.md](docs/tribe.md) |
+| `artifacts/features/<video_id>/video_report.md` | readable per-video report: measured features, heuristic scores, TTCC prediction, recommendations (written by `run_ttcc.py`) |
+| `artifacts/features/segments_merged_all.csv`, `first5s_multimodal.csv`, `speech_ocr_run_summary.json` | run-level versions of the above, rebuilt from every video in the root (older-schema videos listed, not padded) |
 
 Empty CSV cells and JSON `null` mean "not measured". They're never zero.
 Columns, units, status rules and the timeline convention are documented in
@@ -263,6 +312,9 @@ and run the company reels locally.
 | Symptom | Fix |
 |---|---|
 | `speech=failed ... faster-whisper is not installed` / `paddleocr/paddlepaddle are not installed` | Run with `.venv-models/bin/python` (see setup), not `.venv`. |
+| `wrong environment for Task 2 features` (exit 3) | Run `run_pipeline.py` with `.venv/bin/python`. If the root's features came from other library versions on purpose, add `--new-feature-env` (recomputes that root's features). |
+| `no Task 2 features for <id>` / `features predate dependency provenance` | Run the printed `.venv/bin/python scripts/run_pipeline.py ...` command first, with the same `--artifacts`/`--window`/`--proxy-fps`. |
+| `run-level files exclude N videos with older per-video outputs` | Those videos were processed by an older version; re-run them to bring them back into the aggregates. |
 | Speech/OCR slow on the Mac | Measured on 3 company reels: Whisper `small` ran at 0.14–1.42× real time (slowest on music-heavy audio) and OCR took 0.6–1.1 s per 720p frame. Use `--ocr-fps 1`, `--ocr-max-seconds 10`, or a GPU. |
 | `could not load Whisper model ... --download-models` / `OCR models not in ~/.paddlex/...` | The model isn't cached locally. Re-run once with `--download-models`. |
 | Speech text on music-only reels | Whisper can hallucinate on music. Such segments are flagged (`low_confidence`, `possible_non_speech`, `repetitive`) and make the file `uncertain` if nothing else is confident. |
@@ -286,6 +338,5 @@ and run the company reels locally.
   `speech.json`/`ocr.json`, which contain transcripts and on-screen text from the videos).
   Whisper and PaddleOCR models are cached outside the repo (`~/.cache/huggingface`, `~/.paddlex`).
 - Generated reports, `.env` files and tokens (`.env.example` is tracked and holds no secrets).
-- `gemini.json` (Gemini's description of the video) lives under `artifacts/` like everything else derived.
 
 Only code, READMEs, manifests and `reports/snapugc_feasibility.md` are tracked.

@@ -1,11 +1,8 @@
-"""Evidence-grounded editing suggestions for one video.
+"""Evidence-grounded editing observations for one video.
 
-Two sources, never mixed:
-- ``rule``: deterministic checks over measured evidence (Task 2 visual features, librosa,
-  Whisper words, PaddleOCR samples). A rule only fires when the evidence it needs was
-  measured: missing, failed or uncertain modalities never trigger a suggestion.
-- ``gemini``: the model's own edit suggestions (``gemini.json``), passed through with their
-  supporting moment ids and labelled as model interpretation.
+Every recommendation comes from a deterministic rule over measured evidence (Task 2 visual
+features, librosa, Whisper words, PaddleOCR samples, SigLIP frame changes). A rule only fires when
+the evidence it needs was measured: missing, failed or uncertain modalities never trigger anything.
 
 Every recommendation names its interval, the evidence it rests on (ids that exist in the
 per-video artifacts) and why the edit might help. Thresholds are heuristics chosen for
@@ -24,8 +21,11 @@ OPENING_S = 3.0  # "opening" for the no-words check
 QUIET_MIN_S = 1.5  # low-energy interval at least this long (librosa, below silence_dbfs)
 STATIC_MIN_S = 3.0  # same scene, low motion for at least this long
 STATIC_MOTION_MAX = 1.0  # motion_mean (0-255 luma difference); ~ lowest 7 % of company-reel segments
+EARLY_CHANGE_S = 3.0  # opening window for the first visual change (cut or SigLIP content change)
+SIGLIP_CHANGE_MIN = 0.15  # siglip_within_shot_change counted as a visual change (same threshold as scoring)
+LONG_SHOT_S = 10.0  # one scene (no detected cut) at least this long
 CAVEAT = "Heuristic threshold, not validated against retention data."
-EVIDENCE_TYPES = ("segment", "word", "text_event", "librosa_interval", "gemini_moment", "gemini_suggestion")
+EVIDENCE_TYPES = ("segment", "word", "text_event", "librosa_interval")
 
 
 def _segs_in(rows: list[dict], start: float, end: float) -> list[dict]:
@@ -132,50 +132,100 @@ def _static_stretches(rows: list[dict]) -> list[dict]:
     return out
 
 
-def _gemini(gemini: dict | None, rows: list[dict]) -> list[dict]:
-    if not gemini or not gemini.get("measured"):
-        return []
-    out = []
-    for sg in gemini["analysis"]["edit_suggestions"]:
-        segs = _segs_in(rows, sg["start_s"], sg["end_s"])
+def _no_early_visual_change(rows: list[dict], duration: float) -> dict | None:
+    """No scene cut and no SigLIP content change in the opening, with vision measured throughout."""
+    end = min(EARLY_CHANGE_S, duration)
+    if duration < 2 * EARLY_CHANGE_S:
+        return None  # very short clip: the opening is most of the video
+    opening = _segs_in(rows, 0.0, end)
+    if not opening or any(r.get("visual_status") != AVAILABLE for r in opening):
+        return None
+    if any(r.get("scene_cut_at_start") is True and r["start_s"] > 0 for r in opening):
+        return None
+    changes = [r.get("siglip_within_shot_change") for r in opening]
+    if any(c is not None and c >= SIGLIP_CHANGE_MIN for c in changes):
+        return None
+    siglip_note = ("SigLIP frame embeddings also show no content change above "
+                   f"{SIGLIP_CHANGE_MIN:g}." if any(c is not None for c in changes) else
+                   "SigLIP was not run, so a change inside the shot (e.g. a new object) is not ruled out.")
+    return {
+        "rule": "no_early_visual_change",
+        "start_s": 0.0, "end_s": round(end, 3),
+        "suggestion": f"Consider a visual change (cut, zoom, text pop-up or new angle) within the first {end:g} s.",
+        "why": (f"No scene cut was detected in the first {end:g} s. {siglip_note} A single opening shot can work "
+                "(e.g. a strong face-to-camera line), so review rather than apply blindly."),
+        "evidence": _ev("segment", [r["segment_index"] for r in opening]),
+    }
+
+
+def _long_shots(rows: list[dict]) -> list[dict]:
+    """Scenes (between detected cuts) of at least LONG_SHOT_S with vision measured throughout."""
+    out, scenes = [], {}
+    for r in rows:
+        scenes.setdefault(r.get("scene_index"), []).append(r)
+    for idx, segs in scenes.items():
+        if idx is None or any(r.get("visual_status") != AVAILABLE for r in segs):
+            continue
+        s, e = segs[0]["start_s"], segs[-1]["end_s"]
+        if e - s < LONG_SHOT_S:
+            continue
         out.append({
-            "rule": "gemini_suggestion",
-            "start_s": sg["start_s"], "end_s": sg["end_s"],
-            "suggestion": sg["action"],
-            "why": f"{sg['rationale']} Might help because: {sg['expected_effect']}",
-            "evidence": _ev("gemini_suggestion", [sg["id"]]) + _ev("gemini_moment", sg.get("evidence_moment_ids") or [])
-            + _ev("segment", [r["segment_index"] for r in segs]),
-            "model_confidence": sg["confidence"],
+            "rule": "long_shot",
+            "start_s": s, "end_s": e,
+            "suggestion": f"Review the {e - s:.1f} s shot at {s:g}-{e:g} s: a cut, zoom or overlay could vary the pacing.",
+            "why": (f"No scene cut was detected for {e - s:.1f} s (scene {idx}). Long takes can be deliberate "
+                    "(talking head, tutorial step); motion inside the shot is not considered here."),
+            "evidence": _ev("segment", [r["segment_index"] for r in segs]),
+        })
+    return out
+
+
+def _repeated_text(rows: list[dict], ocr: dict | None) -> list[dict]:
+    """On-screen text that disappears and later reappears (OCR ``repeat_of``)."""
+    if not ocr or not ocr.get("measured"):
+        return []
+    events = {e["event_id"]: e for e in ocr.get("events") or []}
+    out = []
+    for e in ocr.get("events") or []:
+        first = events.get(e.get("repeat_of"))
+        if not first:
+            continue
+        s, end = e["first_seen_s"], e["visible_until_s"]
+        segs = _segs_in(rows, s, end)
+        if not segs or end <= s:
+            continue
+        out.append({
+            "rule": "repeated_text",
+            "start_s": s, "end_s": end,
+            "suggestion": f"Check whether repeating the on-screen text at {s:g} s is intended.",
+            "why": (f"The text {e['text']!r} first appeared at {first['first_seen_s']:g} s, disappeared, and is shown again "
+                    f"at {s:g} s (OCR match). Repetition can reinforce a message or feel redundant; review it."),
+            "evidence": _ev("text_event", [first["event_id"], e["event_id"]]) + _ev("segment", [r["segment_index"] for r in segs]),
         })
     return out
 
 
 def build_recommendations(rows: list[dict], words: list[dict], ocr: dict | None, librosa: dict | None,
-                          gemini: dict | None, duration: float | None) -> list[dict]:
+                          duration: float | None) -> list[dict]:
     duration = duration or (rows[-1]["end_s"] if rows else 0.0)
     if not rows:
         return []
-    rule_recs = [r for r in (_opening_without_words(rows, words, ocr, duration), _late_first_word(rows, words, ocr)) if r]
-    rule_recs += _quiet_stretches(rows, words, librosa, duration) + _static_stretches(rows)
+    rule_recs = [r for r in (_opening_without_words(rows, words, ocr, duration), _late_first_word(rows, words, ocr),
+                             _no_early_visual_change(rows, duration)) if r]
+    rule_recs += (_quiet_stretches(rows, words, librosa, duration) + _static_stretches(rows) + _long_shots(rows)
+                  + _repeated_text(rows, ocr))
     recs: list[dict[str, Any]] = []
     for r in sorted(rule_recs, key=lambda r: (r["start_s"], r["rule"])):
         recs.append({"id": f"r{len(recs)}", "source": "rule", "basis": "measured", **r, "caveat": CAVEAT})
-    for r in _gemini(gemini, rows):
-        recs.append({"id": f"r{len(recs)}", "source": "gemini", "basis": "model_interpretation", **r,
-                     "caveat": "Model interpretation; verify against the video before editing."})
     return recs
 
 
-def evidence_index(rows: list[dict], words: list[dict], ocr: dict | None, librosa: dict | None,
-                   gemini: dict | None) -> dict[str, set]:
-    analysis = (gemini or {}).get("analysis") or {}
+def evidence_index(rows: list[dict], words: list[dict], ocr: dict | None, librosa: dict | None) -> dict[str, set]:
     return {
         "segment": {r["segment_index"] for r in rows},
         "word": {w["word_index"] for w in words},
         "text_event": {e["event_id"] for e in (ocr or {}).get("events") or []},
         "librosa_interval": {iv["interval_id"] for iv in (librosa or {}).get("low_energy_intervals") or []},
-        "gemini_moment": {m["id"] for m in analysis.get("moments") or []},
-        "gemini_suggestion": {s["id"] for s in analysis.get("edit_suggestions") or []},
     }
 
 
