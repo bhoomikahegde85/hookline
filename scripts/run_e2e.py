@@ -26,7 +26,6 @@ import json
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -121,22 +120,9 @@ def run_e2e(video: Path, root: Path, run=subprocess.run, log=print, wake=None, *
             return True
         return False
 
-    # Independent steps run at the same time. TTCC and TRIBE run on their own Spaces, speech/OCR and Demucs are local; Gemini needs the TTCC
-    # segments and the speech/OCR evidence, so it waits for them; scoring and the review page need everything.
-    waves = [(("features",), False), (("speech", "retention", "music", "popularity"), True), (("explanation",), False), (("scores:", "explain:", "segments"), False)]
-    by_first = {st["name"].split(" ")[0]: (n, st) for n, st in enumerate(steps, 1)}
-    for names, concurrent in waves:
-        wave = [by_first[nm] for nm in names if nm in by_first]
-        if concurrent and len(wave) > 1:
-            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                stop = any(pool.map(lambda ns: execute(*ns), wave))
-        else:
-            stop = False
-            for ns in wave:
-                if execute(*ns):
-                    stop = True
-                    break
-        if stop:
+    # Steps run one after another, in plan order (each later step reads the files the earlier ones wrote).
+    for n, step in enumerate(steps, 1):
+        if execute(n, step):
             log("stopping: a required step failed, so the later steps have nothing to work on")
             break
     results = sorted(results.items())

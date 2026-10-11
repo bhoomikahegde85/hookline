@@ -295,17 +295,23 @@ def test_spaces_are_woken_at_the_start_and_before_each_remote_step(tmp_path) -> 
     assert woken[0] == "start" and sorted(woken[1:]) == ["tribe", "ttcc"]  # the two remote steps run at the same time, so their order is not fixed
 
 
-def test_independent_steps_really_run_at_the_same_time(tmp_path) -> None:
-    import threading
+def test_steps_run_one_after_another_in_plan_order(tmp_path) -> None:
     e2e = load_script("run_e2e")
-    gate = threading.Barrier(2, timeout=10)  # speech and the retention step must be in flight together, or this raises BrokenBarrierError
     inner = FakeRun()
+    live, overlap, order = [], [], []
 
     def run(cmd, cwd=None, capture_output=True, text=True):
-        if any(str(c).endswith(("run_speech_ocr.py", "run_ttcc.py")) for c in cmd):
-            gate.wait()
-        return inner(cmd, cwd=cwd, capture_output=capture_output, text=text)
+        live.append(1)
+        overlap.append(len(live))
+        order.append(next((str(c) for c in cmd if str(c).endswith(".py")), ""))
+        try:
+            return inner(cmd, cwd=cwd, capture_output=capture_output, text=text)
+        finally:
+            live.pop()
     page = tmp_path / "root" / "features" / "v" / "review.html"
     page.parent.mkdir(parents=True)
     page.write_text("x")
     assert e2e.run_e2e(tmp_path / "v.mp4", tmp_path / "root", run=run, log=lambda _l: None, **opts(gemini_allow_remote=True)) == 0
+    assert max(overlap) == 1  # never two steps in flight at once
+    planned = [next(str(c) for c in st["cmd"] if str(c).endswith(".py")) for st in e2e.plan(tmp_path / "v.mp4", tmp_path / "root", **opts(gemini_allow_remote=True))]
+    assert [o for o in order if o in planned] == planned
