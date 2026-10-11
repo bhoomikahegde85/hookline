@@ -33,7 +33,7 @@ from .tribe import load_secret
 ARTIFACT = "gemini_edit.json"
 CATEGORIES = ("tighten_hook", "remove_dead_space", "adjust_pacing", "change_cuts", "add_caption", "fix_audio", "other")
 EDIT_TYPES = ("trim", "add", "review")
-NOTE = ("Model interpretation (Gemini) of a video segment and unvalidated edit hypotheses. TTCC's retention curve is a prediction, not audience "
+NOTE = ("Model interpretation (AI) of a video segment and unvalidated edit hypotheses. TTCC's retention curve is a prediction, not audience "
         "data; neither model has been validated on these videos.")
 MAX_WORDS, MAX_CUTS, MAX_TEXT, MAX_RULES = 300, 80, 60, 40
 WORDS_PER_ANALYSED_S = 4  # transcript budget scales with the seconds sent, so a longer clip set keeps its late words too
@@ -359,7 +359,7 @@ def validate(raw: Any, pack: dict, cfg: GeminiConfig) -> tuple[dict, dict]:
             sugs.append({"category": s["category"], "action": _clip_text(s["action"], 400), "rationale": _clip_text(s.get("rationale"), 500),
                          "expected_effect": _clip_text(s.get("expected_effect"), 300), "confidence": None if conf is None else min(1.0, max(0.0, conf)),
                          "evidence_refs": refs, "edit": {"type": edit["type"], "start_s": a, "end_s": a if edit["type"] == "add" else b},
-                         "status": "hypothesis (Gemini), unvalidated"})
+                         "status": "hypothesis (AI), unvalidated"})
         if len(sugs) > cfg.max_suggestions_per_segment:
             issues.append(f"{sid}: {len(sugs) - cfg.max_suggestions_per_segment} suggestion(s) beyond the cap of {cfg.max_suggestions_per_segment} dropped")
             dropped += len(sugs) - cfg.max_suggestions_per_segment
@@ -553,7 +553,7 @@ def extract_gemini_edit(d: Path, video_path: Path, cfg: GeminiConfig, transport_
         try:
             raw = json.loads(text)
         except ValueError as exc:
-            base["reason"] = f"Gemini returned text that is not valid JSON ({exc})"
+            base["reason"] = f"the AI returned text that is not valid JSON ({exc})"
             return base
         analysis, validation = validate(raw, pack, cfg)
     except Exception as exc:
@@ -568,7 +568,7 @@ def extract_gemini_edit(d: Path, video_path: Path, cfg: GeminiConfig, transport_
     usable = sum(len(s["suggestions"]) + len(s["observations"]) for s in analysis["segments"])
     base.update(analysis=analysis, validation=validation, seconds=round(time.perf_counter() - t0, 2), measured=usable > 0,
                 status=("uncertain" if validation["dropped"] else "available") if usable else "failed",
-                reason=None if usable else "Gemini's answer contained nothing that passed validation")
+                reason=None if usable else "the AI's answer contained nothing that passed validation")
     return base
 
 

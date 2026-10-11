@@ -29,7 +29,7 @@ from . import views_eval as ve
 
 SCORES_FILE = "hook_scores.json"
 MIN_REFERENCE = ve.MIN_TTCC_VIDEOS
-NOTE = ("Scores are positions among 100 reference reels with real views, from models whose measured accuracy is listed next to them. They are "
+NOTE = ("Scores are positions among reference reels with real views, from models whose measured accuracy is listed next to them. They are "
         "model predictions, not audience data, and not a statement that a video will or will not go viral: reach also depends on distribution, "
         "timing and trends that are not in the video.")
 

@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--artifacts", type=Path, default=PROJECT_ROOT / "artifacts" / "app", help="where uploads and analyses are stored")
     ap.add_argument("--port", type=int, default=8770)
-    ap.add_argument("--hook-s", type=int, default=10, help="seconds of the opening TTCC analyses (10 matches the reference run and fits a 24 GB GPU)")
+    ap.add_argument("--hook-s", type=int, default=30, help="seconds of the opening TTCC analyses in one native pass (30 needs the L40S Space; 10 fits a 24 GB L4)")
     ap.add_argument("--max-upload-mb", type=int, default=300)
     ap.add_argument("--open", action="store_true", help="open the page in the default browser")
     args = ap.parse_args(argv)

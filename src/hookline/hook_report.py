@@ -32,7 +32,7 @@ HOOK_RULES: dict[str, dict] = {
     "first_cut_s": {"label": "Time to first visible cut", "unit": "s", "rule": "lower_better", "group": "measured", "event": "cut",
                     "why": RULE_TAG + "a long wait with nothing changing on screen may let attention drift; a single continuous shot is not penalised."},
     "cuts_per_s_0_5": {"label": "Cuts per second", "unit": "cuts/s", "rule": "none", "group": "measured", "event": None,
-                       "why": RULE_TAG + "shown for context, not scored: in the 100 reference reels cuts per second had no measurable relation to outcome (Spearman about 0.0), so neither a fast nor a slow opening is treated as better or worse."},
+                       "why": RULE_TAG + "shown for context, not scored: in the reference reels cuts per second had no measurable relation to outcome (Spearman about 0.0), so neither a fast nor a slow opening is treated as better or worse."},
     "motion_mean_0_5": {"label": "Mean motion", "unit": "frame-difference units", "rule": "higher_better", "group": "measured", "event": None,
                         "why": RULE_TAG + "visible movement in the opening may catch the eye more than a still frame."},
     "brightness_mean_0_5": {"label": "Brightness", "unit": "0-255", "rule": "mid_best", "group": "measured", "event": None,
@@ -52,7 +52,7 @@ HOOK_RULES: dict[str, dict] = {
     "ttcc_R10": {"label": "Predicted hold at 10 s", "unit": "fraction", "rule": "higher_better", "group": "ttcc", "event": None,
                  "why": RULE_TAG + "TTCC's predicted share still watching at 10 s; a higher value may mean the hook carries into the body. A model prediction, not measured retention."},
 }
-NOTE = ("This report compares the video with {n} reference reels, using rules of thumb that are not validated against audience data. It is "
+NOTE = ("This report compares the video with reference reels, using rules of thumb that are not validated against audience data. It is "
         "not a viral verdict: whether a reel spreads also depends on distribution, timing and trends that are not in the video.")
 
 
@@ -227,7 +227,7 @@ def build_hook_report(video_dir: Path, data_root: Path, features_root: Path, ttc
     return {"schema": "hookline.hook_report", "video_id": vid, "status": "ok", "reason": None, "verdict": _verdict(video_dir, factors), "factors": factors,
             "strengths": strengths, "weaknesses": weaknesses, "gemini_hook_assessment": _gemini_text(video_dir),
             "reference": {"n_reels": n, "n_with_ttcc": n_ttcc,
-                          "note": (f"Percentile = share of {n} reference reels (regular reels of the dataset, outliers and this video excluded) with a lower value; "
+                          "note": (f"Percentile = share of the reference reels (regular reels of the dataset, outliers and this video excluded) with a lower value; "
                                    f"TTCC factors are compared with the {n_ttcc} that have a TTCC prediction.")},
             "note": NOTE.format(n=n or "the")}
 

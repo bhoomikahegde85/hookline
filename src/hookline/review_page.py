@@ -25,6 +25,7 @@ from .ttcc import hook_metrics
 
 REVIEW_FILE = "review.html"
 REFERENCE_CURVES = Path(__file__).resolve().parents[2] / "artifacts" / "hook" / "features"  # TTCC predictions of the 100+ reference reels
+REFERENCE_CURVES_LONG = Path(__file__).resolve().parents[2] / "artifacts" / "hook_long" / "features"  # same reels, native 30 s pass
 BAND_MIN_REELS = 30
 # TTCC's prediction for a video whose frames are all black (the first 10 s). Measured on 3 reels in the sanity run 20261010T183353Z; the three
 # curves were identical, so it is the model's content-free baseline. A real video's curve is read against it: above means TTCC sees content it likes.
@@ -35,12 +36,17 @@ def reference_band(root: Path | None = None) -> dict | None:
     """Per-second 10th / 50th / 90th percentile of the reference reels' predicted retention (native pass), where at least BAND_MIN_REELS
     reels have a value. TTCC curves are close to one shared decay shape, so a video's curve is read against this band."""
     import numpy as np
-    root = REFERENCE_CURVES if root is None else root
-    curves = []
-    for f in sorted(root.glob("*/ttcc_retention.json")) if root.is_dir() else []:
-        a = _load(f)
-        if a and a.get("status") == "success" and a.get("retention"):
-            curves.append(a["retention"])
+    def read(r: Path) -> list:
+        out = []
+        for f in sorted(r.glob("*/ttcc_retention.json")) if r.is_dir() else []:
+            a = _load(f)
+            if a and a.get("status") == "success" and a.get("retention"):
+                out.append(a["retention"])
+        return out
+    # the longer (stitched, to ~30 s) reference curves when they exist, else the 10 s native hook curves
+    curves = read(REFERENCE_CURVES_LONG) if root is None else []
+    if len(curves) < BAND_MIN_REELS:
+        curves = read(REFERENCE_CURVES if root is None else root)
     if len(curves) < BAND_MIN_REELS:
         return None
     t_max = 0
@@ -49,7 +55,7 @@ def reference_band(root: Path | None = None) -> dict | None:
     cols = [[c[t] for c in curves if len(c) > t] for t in range(t_max + 1)]
     q = lambda p: [round(float(np.percentile(v, p)), 4) for v in cols]  # noqa: E731
     return {"n_reels": len(curves), "p10": q(10), "p50": q(50), "p90": q(90), "blank": BLANK_VIDEO_CURVE,
-            "note": "10th-90th percentile and median of TTCC's predicted retention on the reference reels (native pass); predictions, not audience data"}
+            "note": "10th-90th percentile and median of TTCC's predicted retention on the reference reels (one native pass over the first 30 s); predictions, not audience data"}
 
 
 def _load(path: Path):
@@ -89,7 +95,7 @@ def build_review(video_dir: Path, video_path: Path | None = None) -> Path | None
     dr, art = _load(video_dir / "ttcc_dropoffs.json"), _load(video_dir / "ttcc_retention.json")
     if not dr or not art:
         return None
-    rec = build_segment_recommendations(video_dir)  # TTCC segments + rule proposals + Gemini
+    rec = build_segment_recommendations(video_dir)  # TTCC segments + rule proposals + AI
     cards = []
     for sg in rec["segments"]:
         if sg["kind"] == "unflagged" and not sg["proposals"] and not sg["gemini"]:
@@ -312,7 +318,7 @@ body[data-view="analysis"] video{height:min(62vh,620px)}
   </section>
   <section class="panel" data-view="analysis" id="topsugs">
     <h2>Top suggested edits</h2>
-    <p class="sub">AI SUGGESTION = written by Gemini after watching and listening to the video; RULE-BASED = a fixed rule over measured features. Neither is tested on real audience data, so treat them as ideas to check. Inspect the evidence, or review the trim in Edit Review.</p>
+    <p class="sub">AI SUGGESTION = written by AI after watching and listening to the video; RULE-BASED = a fixed rule over measured features. Neither is tested on real audience data, so treat them as ideas to check. Inspect the evidence, or review the trim in Edit Review.</p>
     <div id="topsugslist"></div>
   </section>
   <section class="panel" data-view="insights" id="momentspanel" style="display:none">
@@ -341,11 +347,6 @@ body[data-view="analysis"] video{height:min(62vh,620px)}
   <section class="panel" data-view="edit" id="exports">
     <h2>Export</h2><p class="sub">Your decisions stay in this browser until you export them. Nothing is uploaded.</p>
     <div class="row-actions" style="margin-top:4px"><button class="primary" id="exportjson">Export edit decisions (JSON)</button><button class="primary" id="exportcsv">Export edit decisions (CSV)</button><button id="clear">Clear my decisions</button><span class="mut" id="saved"></span></div>
-  </section>
-  <section class="panel" data-view="diagnostics" id="diag">
-    <h2>Model and pipeline diagnostics</h2>
-    <p class="sub">Technical detail kept off the main screens.</p>
-    <div id="diagbody"></div>
   </section>
   <section class="panel" data-view="diagnostics" id="seconds">
     <details><summary>Second by second (predicted R(t), drop, class, what was measured)</summary>
@@ -388,7 +389,7 @@ function cur(sg){const s=store[sg.id]||{};return{decision:s.decision||'undecided
 function acceptedTrims(){return SUGS.filter(sg=>sg.c.edit.action==='trim').map(sg=>({sg,s:cur(sg)})).filter(x=>x.s.decision==='accepted'&&x.s.b>x.s.a).map(x=>({a:x.s.a,b:x.s.b})).sort((p,q)=>p.a-q.a).reduce((m,r)=>{const l=m[m.length-1];if(l&&r.a<=l.b)l.b=Math.max(l.b,r.b);else m.push({a:r.a,b:r.b});return m;},[]);}
 function exportRow(sg){const s=cur(sg);const act=sg.c.edit.action;return{video_id:D.video_id,interval_id:sg.iv.id,interval_kind:sg.iv.kind,interval_start_s:sg.iv.start_s,interval_end_s:sg.iv.end_s,predicted_R_start:+sg.iv.retention_start.toFixed(4),predicted_R_end:+sg.iv.retention_end.toFixed(4),source:sg.c.source,rule:sg.c.rule,suggestion:sg.c.suggestion,rationale:sg.c.rationale||'',confidence:sg.c.confidence==null?'':sg.c.confidence,evidence_refs:(sg.c.evidence_refs||[]).join(' '),action:act,edit_start_s:act==='add'?sg.c.edit.start_s:+(+s.a).toFixed(2),edit_end_s:act==='add'?'':+(+s.b).toFixed(2),decision:s.decision,note:s.note,data_kind:'predicted_retention_unvalidated'};}
 function buildExport(){const items=SUGS.map(exportRow);const tr=acceptedTrims();const removed=tr.reduce((a,r)=>a+(r.b-r.a),0);
-return{video_id:D.video_id,sha256:D.sha256,exported_at:new Date().toISOString(),disclaimer:DISCLAIMER,gemini_used:!!(D.gemini_info&&D.gemini_info.used),gemini_model:D.gemini_info&&D.gemini_info.used?D.gemini_info.model:null,retention_is_prediction:true,model:D.model,
+return{video_id:D.video_id,sha256:D.sha256,exported_at:new Date().toISOString(),disclaimer:DISCLAIMER,ai_used:!!(D.gemini_info&&D.gemini_info.used),retention_is_prediction:true,model:D.model,
 original_duration_s:TOTAL,hook:D.hook,segment_scores:segmentRows(),segment_scores_note:'predicted fall = TTCC model prediction; heuristic risk/quality = hand-set rules over measured features; not combined, not audience data',accepted_trims:tr.map(r=>({start_s:+r.a.toFixed(2),end_s:+r.b.toFixed(2)})),duration_after_accepted_trims_s:+(TOTAL-removed).toFixed(2),edits:items};}
 // ---- header
 document.title='Hookline — '+D.video_id;$('title').textContent='Video analysis & editing — '+D.video_id;
@@ -399,11 +400,11 @@ $('topexport').addEventListener('click',()=>{$('exports').scrollIntoView({behavi
 if(SRC){V.src=SRC;V.addEventListener('error',()=>{$('vnote').textContent='The browser could not load the video ('+(SERVED?'the file may be missing or use a codec this browser cannot play':'opened as a local file')+'). Use the Hookline app, or: python3 scripts/serve_review.py '+D.video_id+' --artifacts <root> --video <file> --open. Timestamps still apply.';});}
 else{V.style.display='none';if(!SERVED&&D.video_url){$('vnote').textContent='This page was opened as a local file, which browsers block from playing video. Open it through Hookline: python3 scripts/serve_review.py '+D.video_id+' --artifacts <root> --video <file> --open';}else $('vnote').textContent='The video file was not found. Timestamps still apply, but playback and previews are unavailable.';}
 const GI=D.gemini_info||{used:false};const gb0=$('geminibox');
-if(GI.used){gb0.append(el('h2',{text:'Gemini overview (model interpretation)'}));if(GI.overall){gb0.append(el('p',{text:GI.overall.hook_assessment}));if(GI.overall.top_priorities.length)gb0.append(el('p',{class:'mut',text:'Gemini\'s priority order: '+GI.overall.top_priorities.join(' → ')}));}
+if(GI.used){gb0.append(el('h2',{text:'AI overview (model interpretation)'}));if(GI.overall){gb0.append(el('p',{text:GI.overall.hook_assessment}));if(GI.overall.top_priorities.length)gb0.append(el('p',{class:'mut',text:'AI\'s priority order: '+GI.overall.top_priorities.join(' → ')}));}
 if(GI.audio){const A=GI.audio;gb0.append(el('h3',{text:'Audio (AI hypothesis, from listening)'}),el('p',{text:A.kind.replace(/_/g,' ')+(A.energy?' · '+A.energy+' energy':'')+'. '+A.description}),el('p',{class:'mut',text:A.familiarity+' Trend status is not known to this tool.'}));if(A.fit){gb0.append(el('div',{class:'fcard',style:'--c:'+(A.fit.verdict==='fits'?'#5fd38a':A.fit.verdict==='clashes'?'#ff5468':'#ffcf47')},el('b',{text:'Does the audio suit the video? '+A.fit.verdict+' (AI hypothesis)'}),el('div',{class:'why',text:A.fit.reason})));}
 if(A.changes&&A.changes.length)gb0.append(el('p',{class:'mut',text:'Audio moments: '+A.changes.map(c=>mmss(c.at_s)+' '+c.what).join(' · ')}));}
-gb0.append(el('p',{class:'mut',text:'Gemini ('+(GI.model||'model')+') explains the content and proposes edits; TTCC predicts retention. All of it is hypotheses until validated against real audience-retention data.'+(GI.validation&&GI.validation.dropped?' '+GI.validation.dropped+' item(s) of its answer failed validation and were dropped.':'')}));}
-else{gb0.append(el('h2',{text:'Gemini'}),el('p',{class:'mut',text:'Gemini interpretation: not used'+(GI.reason?' ('+GI.reason+')':'')+'. Proposals are rule-based only.'}));}
+gb0.append(el('p',{class:'mut',text:'AI explains the content and proposes edits; TTCC predicts retention. All of it is hypotheses until validated against real audience-retention data.'+(GI.validation&&GI.validation.dropped?' '+GI.validation.dropped+' item(s) of its answer failed validation and were dropped.':'')}));}
+else{gb0.append(el('h2',{text:'AI'}),el('p',{class:'mut',text:'AI interpretation: not used'+(GI.reason?' ('+GI.reason+')':'')+'. Proposals are rule-based only.'}));}
 // ---- control: jump / previews
 let mode=null;function startPlay(){if(SRC)V.play().catch(()=>{});}
 function ensurePlayer(){if(!['analysis','edit'].includes(document.body.getAttribute('data-view')))setView('edit',true);}
@@ -438,15 +439,15 @@ add('RETENTION (predicted)',RP?RP['5s']:null,'#ffcf47',RP?['1s','3s','5s','10s']
 })();
 // ---- hook strength: why it is strong or weak (from hook_report.json)
 (function(){const R=D.hook_report;if(!R||R.status!=='ok')return;const box=$('hookwhy');box.style.display='';const V=R.verdict||{};
-const label=(V.label||'not rated');const vrow=el('div',{class:'verdict'},el('span',{class:'vb '+label.replace(' ',''),text:'PREDICTED HOLD: '+({strong:'ABOVE TYPICAL',weak:'BELOW TYPICAL',average:'TYPICAL'}[label]||label.toUpperCase())}),el('span',{class:'mut',text:(V.basis||'')+' On the 100 reference reels this did not track views (reels in the bottom quarter beat their page\'s median 40% of the time, the top quarter 44%), so read it as a description of the predicted curve, not a grade.'}));box.append(vrow);
+const label=(V.label||'not rated');const vrow=el('div',{class:'verdict'},el('span',{class:'vb '+label.replace(' ',''),text:'PREDICTED HOLD: '+({strong:'ABOVE TYPICAL',weak:'BELOW TYPICAL',average:'TYPICAL'}[label]||label.toUpperCase())}),el('span',{class:'mut',text:(V.basis||'')+' On the reference reels this did not track views (reels in the bottom quarter beat their page\'s median 40% of the time, the top quarter 44%), so read it as a description of the predicted curve, not a grade.'}));box.append(vrow);
 const byKey={};(R.factors||[]).forEach(f=>byKey[f.key]=f);
 const card=(f,good)=>{const c=el('div',{class:'fcard'});c.style.setProperty('--c',good?'#5fd38a':'#ff5468');
-const pctTxt=f.percentile_vs_reference==null?'':' · '+Math.round(f.percentile_vs_reference)+'th percentile of '+((R.reference&&R.reference.n_reels)||100)+' reference reels';
+const pctTxt=f.percentile_vs_reference==null?'':' · '+Math.round(f.percentile_vs_reference)+'th percentile of the reference reels';
 c.append(el('b',{text:f.label+': '+(f.value==null?'n/a':(typeof f.value==='number'?(+f.value.toFixed(2)):f.value)+(f.unit?' '+f.unit:''))+pctTxt}),el('div',{text:f.reading||''}),el('div',{class:'why',text:f.why_it_matters||''}));return c;};
 const cols=el('div',{class:'cols2'});const a=el('div',{},el('div',{class:'mut',text:'Working for the hook'}));const b=el('div',{},el('div',{class:'mut',text:'Working against it'}));
 (R.strengths||[]).forEach(k=>byKey[k]&&a.append(card(byKey[k],true)));(R.weaknesses||[]).forEach(k=>byKey[k]&&b.append(card(byKey[k],false)));
 if(a.children.length===1)a.append(el('div',{class:'mut',text:'Nothing stood out as helping, against the reference reels.'}));if(b.children.length===1)b.append(el('div',{class:'mut',text:'Nothing stood out as hurting, against the reference reels.'}));cols.append(a,b);box.append(cols);
-if(R.gemini_hook_assessment){box.append(el('div',{class:'fcard',style:'--c:#b47cf0'},el('b',{text:'Gemini on the opening (model interpretation)'}),el('div',{text:R.gemini_hook_assessment})));}
+if(R.gemini_hook_assessment){box.append(el('div',{class:'fcard',style:'--c:#b47cf0'},el('b',{text:'AI on the opening (model interpretation)'}),el('div',{text:R.gemini_hook_assessment})));}
 const det=el('details',{style:'margin-top:8px'},el('summary',{text:'All hook factors'}));const t=el('table');t.append(el('thead',{},el('tr',{},...['Factor','Value','Percentile','Reading'].map(h=>el('th',{text:h})))));const tb=el('tbody');
 (R.factors||[]).forEach(f=>tb.append(el('tr',{},el('td',{text:f.label}),el('td',{class:'mono',text:f.value==null?'n/a':(typeof f.value==='number'?+f.value.toFixed(3):f.value)+(f.unit?' '+f.unit:'')}),el('td',{class:'mono',text:f.percentile_vs_reference==null?'–':Math.round(f.percentile_vs_reference)}),el('td',{text:(f.direction||'')+' · '+(f.reading||'')}))));t.append(tb);det.append(t);box.append(det);
 box.append(el('p',{class:'mut',style:'margin:8px 0 0',text:R.note||''}));})();
@@ -508,7 +509,7 @@ const GRID=logScale?[1,0.1,0.01,0.001]:[0,0.25,0.5,0.75,1];for(const r of GRID){
 const step=n<=10?1:n<=40?5:10;for(let t=0;t<=n;t+=step){svg.append(mk('line',{x1:x(t),x2:x(t),y1:T,y2:T+ph,stroke:'#1a1e2b','stroke-width':1}));const tx=mk('text',{x:x(t),y:Hh-8,'text-anchor':'middle','font-size':11,fill:'#8c92a6','font-family':'ui-monospace,Menlo,monospace'});tx.textContent=t+'s';svg.append(tx);}
 for(const iv of D.intervals){svg.append(mk('rect',{x:x(iv.start_s),y:T,width:Math.max(2,x(iv.end_s)-x(iv.start_s)),height:ph,fill:COLOR[iv.kind]||'#5b6276','fill-opacity':'0.07'}));}
 if(D.ref_band){const B=D.ref_band,m=Math.min(n,B.p50.length-1);const up=[],dn=[],md=[];for(let t=0;t<=m;t++){up.push(x(t)+','+y(B.p90[t]));dn.unshift(x(t)+','+y(B.p10[t]));md.push(x(t)+','+y(B.p50[t]));}
-const bp=mk('polygon',{points:up.concat(dn).join(' '),fill:'#8c92a6','fill-opacity':0.18});const bt=mk('title',{});bt.textContent='Where 80% of '+B.n_reels+' reference reels\' predicted curves fall';bp.append(bt);svg.append(bp);
+const bp=mk('polygon',{points:up.concat(dn).join(' '),fill:'#8c92a6','fill-opacity':0.18});const bt=mk('title',{});bt.textContent='Where 80% of the reference reels\' predicted curves fall';bp.append(bt);svg.append(bp);
 svg.append(mk('polyline',{points:md.join(' '),fill:'none',stroke:'#8c92a6','stroke-width':1.4,'stroke-dasharray':'5 4'}));
 if(B.blank){const bl=[];for(let t=0;t<=Math.min(n,B.blank.length-1);t++)bl.push(x(t)+','+y(B.blank[t]));svg.append(mk('polyline',{points:bl.join(' '),fill:'none',stroke:'#ff5468','stroke-width':1.2,'stroke-dasharray':'1.5 3.5','stroke-linecap':'round'}));}}
 const pts=D.retention.map((r,t)=>x(t)+','+y(r));svg.append(mk('polygon',{points:x(0)+','+(T+ph)+' '+pts.join(' ')+' '+x(n)+','+(T+ph),fill:'url(#gfill)'}));
@@ -528,7 +529,7 @@ const LABEL={steep_drop:'Major drop',sustained_decline:'Decline',holds:'Holds',u
 function kindLabel(k){return {steep_drop:'Steep predicted drop',sustained_decline:'Sustained predicted decline',holds:'Predicted to hold',unflagged:'No predicted drop'}[k]||k;}
 const ivOf=(sg)=>D.intervals.find(iv=>iv.start_s===sg.start_s&&iv.end_s===sg.end_s&&iv.kind===sg.kind);
 function shortDesc(sg,iv){const bits=['R '+pc(sg.retention_start)+' → '+pc(sg.retention_end)];if(sg.share_of_total_predicted_loss!=null)bits.push(Math.round(100*sg.share_of_total_predicted_loss)+'% of the predicted fall');
-const n=iv?iv.candidate_causes.length:0;if(n)bits.push(n+' proposal'+(n>1?'s':''));if(iv&&iv.gemini)bits.push('Gemini notes');return bits.join(' · ');}
+const n=iv?iv.candidate_causes.length:0;if(n)bits.push(n+' proposal'+(n>1?'s':''));if(iv&&iv.gemini)bits.push('AI notes');return bits.join(' · ');}
 const rows=[];const seglist=$('seglist');
 D.segments.forEach((sg,i)=>{const iv=ivOf(sg);const r=el('div',{class:'srow '+sg.kind});r.style.setProperty('--c',COLOR[sg.kind]);
 const lab=el('div',{},el('span',{class:'lb',text:(sg.start_s===0?'Hook · ':'')+(LABEL[sg.kind]||sg.kind)}),el('span',{class:'ds',text:shortDesc(sg,iv)}));
@@ -557,7 +558,7 @@ const what=el('div',{class:'sec'},el('h4',{},el('i',{}),'What was measured here'
 const ev=el('div',{class:'sec'},el('h4',{},el('i',{}),'Evidence'));const w=iv.observed.words;
 if(w!=='not run'&&w.count&&w.text){ev.append(el('div',{class:'mut',text:'Transcript'}),el('div',{class:'quote',text:'“'+w.text+'”'}));}
 ev.append(el('div',{class:'mut',text:'Frame and audio analysis'}));const ch=el('div',{class:'chips'});for(const c of chips(iv.observed))ch.append(el('span',{text:c}));ev.append(ch);card.append(ev);
-if(iv.gemini){const gb=el('div',{class:'sec'},el('h4',{},el('i',{}),'Gemini: what it observed (model interpretation)'));if(iv.gemini.summary)gb.append(el('div',{text:iv.gemini.summary}));
+if(iv.gemini){const gb=el('div',{class:'sec'},el('h4',{},el('i',{}),'AI: what it observed (model interpretation)'));if(iv.gemini.summary)gb.append(el('div',{text:iv.gemini.summary}));
 const gl=el('ul');for(const o of iv.gemini.observations)gl.append(el('li',{text:(o.kind==='observation'?'Observed: ':'Interpretation: ')+o.text+(o.evidence_refs.length?'  ['+o.evidence_refs.join(', ')+']':'')}));gb.append(gl);
 if(iv.gemini.hypothesis)gb.append(el('div',{class:'mut',text:'Hypothesis'+(iv.gemini.hypothesis_confidence!=null?' (confidence '+iv.gemini.hypothesis_confidence.toFixed(2)+', how well the cited evidence supports it, not a retention probability)':'')+': '+iv.gemini.hypothesis}));card.append(gb);}
 const pr=el('div',{class:'sec'},el('h4',{},el('i',{}),'Predicted retention (model prediction)'));
@@ -569,7 +570,7 @@ if(iv.kind==='holds'&&!iv.candidate_causes.length){rec.append(el('div',{class:'m
 else if(!iv.candidate_causes.length){rec.append(el('div',{class:'mut',text:'No rule matched this segment. Review the measured items above by hand.'}));}
 SUGS.filter(sg=>sg.iv===iv).forEach((sg)=>{const c=sg.c,e=c.edit,s=cur(sg);const box=el('div',{class:'sug'+(c.source==='gemini'?' gem':'')});
 box.append(el('div',{},el('span',{class:'tag',text:ACTION[e.action]}),document.createTextNode(c.suggestion)));
-if(c.source==='gemini'){const bits=['Gemini (model interpretation, hypothesis)'];if(c.confidence!=null)bits.push('confidence '+c.confidence.toFixed(2));box.append(el('div',{class:'mut',text:bits.join(' · ')}));
+if(c.source==='gemini'){const bits=['AI (model interpretation, hypothesis)'];if(c.confidence!=null)bits.push('confidence '+c.confidence.toFixed(2));box.append(el('div',{class:'mut',text:bits.join(' · ')}));
 if(c.rationale)box.append(el('div',{class:'mut',text:'Why: '+c.rationale}));if(c.expected_effect)box.append(el('div',{class:'mut',text:'Expected effect (hypothesis): '+c.expected_effect}));
 if(c.evidence_refs.length)box.append(el('div',{class:'mut',text:'Evidence: '+c.evidence_refs.join(', ')}));}
 else box.append(el('div',{class:'mut',text:'Unvalidated hypothesis from the rule “'+c.rule+'”.'}));
@@ -671,16 +672,16 @@ const b1=el('button',{class:'small',text:'Inspect evidence'});b1.addEventListene
 const b2=el('button',{class:'small primary',text:e.action==='trim'?'Review trim':'Review'});b2.addEventListener('click',()=>{setView('edit');select(sg.iv.id);});
 row.append(el('b',{text:mmss(sg.iv.start_s)+'–'+mmss(sg.iv.end_s)+'  '+c.suggestion}),el('div',{class:'acts'},b1,b2),
 el('div',{class:'why'},el('span',{class:'tag'+(c.source==='gemini'?' ai':''),text:c.source==='gemini'?'AI SUGGESTION':'RULE-BASED'}),c.rationale||''));tl.append(row);});
-(function diag(){const b=$('diagbody');const add=(h,node)=>{b.append(el('h3',{text:h}),node);};
+(function diag(){const b=$('diagbody');if(!b)return;const add=(h,node)=>{b.append(el('h3',{text:h}),node);};
 const kv=(o)=>el('pre',{text:JSON.stringify(o,null,2)});
 add('TTCC prediction',kv({model:D.model,status:(D.ttcc_status||{}).status||null,reason:(D.ttcc_status||{}).reason||null,analysed_span_s:D.horizon_s,video_duration_s:D.duration_s,partial:!!D.partial,
 native_hook_pass_s:(D.hook||{}).window_end_s||null,full_curve:D.stitched?'merged 10 s windows every 5 s in hazard space: APPROXIMATE, not one native pass':'single native pass',deviations_from_upstream:D.deviations}));
 add('Processing audit (what was and was not done to the curve)',kv(D.curve_audit||'not available'));
 add('Inference configuration',kv(D.inference||'not recorded'));
 b.append(el('p',{class:'mut',text:'Attention kernel: a run may use sdpa or flash_attn. They compute the same attention with different floating-point rounding, so predictions can differ slightly between kernels. How much, for these videos, has not been measured; the configuration above records what ran where it is available.'}));
-const GI=D.gemini_info||{};add('Gemini',kv({used:!!GI.used,model:GI.model||null,status:GI.status||null,reason:GI.reason||null,validation:GI.validation||null}));
+const GI=D.gemini_info||{};add('AI',kv({used:!!GI.used,status:GI.status||null,reason:GI.reason||null,validation:GI.validation||null}));
 add('Music vs voice (Demucs, first 5 s)',kv(D.stems?Object.fromEntries(Object.entries(D.stems).filter(([k])=>k!=='per_second')):'not run'));
-add('Scores: how to read them',el('p',{class:'mut',text:'Breakout and hook are percentiles among the 100 reference reels with real views (50 = typical). '+((D.scores&&D.scores.note)||'')}));
+add('Scores: how to read them',el('p',{class:'mut',text:'Breakout and hook are percentiles among reference reels with real views (50 = typical). '+((D.scores&&D.scores.note)||'')}));
 add('Evidence availability',kv((D.hook_report||{}).evidence_availability||'not recorded'));
 add('Hook and score files',kv({hook_scores:D.scores?'present':'absent',hook_report:D.hook_report?'present':'absent',moments:D.moments?'present':'absent'}));})();
 setView((location.hash||'').slice(1),true);

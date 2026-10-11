@@ -50,7 +50,7 @@ def plan(video: Path, root: Path, *, allow_remote: bool, approve: str | None, si
                     "--warmup-s", str(hook_s / 4)] if (full_curve and hook_s) else [])],
          "skip": None if allow_remote else "not run: the video is uploaded to your Space only with --allow-remote"},
         # required: Gemini reads the video plus the transcript and measured evidence to write the explanations and edit suggestions
-        {"name": "explanation + edit suggestions (Gemini: video + transcript, uploads the video to Google)",
+        {"name": "explanation + edit suggestions (AI: video + transcript)",
          "cmd": [str(VENV_MODELS), "scripts/run_gemini_edit.py", vid, "--artifacts", str(root), "--video", str(video), "--gemini-allow-remote",
                  *(["--gemini-approve", approve] if approve else [])],
          "skip": None if gemini_allow_remote else "not run: the video is uploaded to Google only with --gemini-allow-remote"},
@@ -158,7 +158,7 @@ def hint(step: int, code: int, out: str) -> str:
     if step == 4:
         if "GEMINI_API_KEY" in out or "API key" in out or "API_KEY_INVALID" in out or "PERMISSION_DENIED" in out:
             return "  -> check GEMINI_API_KEY in your .env (use the new key, not the revoked one)"
-        return "  -> Gemini is required: see the lines above (network, quota or an unreadable video); cached steps are reused on a rerun"
+        return "  -> the AI step is required: see the lines above (network, quota or an unreadable video); cached steps are reused on a rerun"
     if step in (1, 2):
         return "  -> a local step failed; check the lines above (is the right environment installed? see the README)"
     return "  -> see the lines above"

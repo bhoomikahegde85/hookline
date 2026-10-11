@@ -17,7 +17,7 @@ from .gemini_edit import NOTE as GEMINI_NOTE
 from .gemini_edit import segments_key
 
 FILE = "segment_recommendations.json"
-STATUS = "hypotheses: TTCC's curve is a prediction and Gemini's explanations are interpretations; neither is validated against audience data"
+STATUS = "hypotheses: TTCC's curve is a prediction and the AI's explanations are interpretations; neither is validated against audience data"
 
 
 def _load(path: Path):
@@ -68,13 +68,13 @@ def build_segment_recommendations(d: Path) -> dict | None:
             "gemini": None if not g else {"summary": g["summary"], "observations": g["observations"], "hypothesis": g["hypothesis"],
                                           "hypothesis_confidence": g["hypothesis_confidence"]},
             "gemini_scope": None if not scope else {"analysed": sg["id"] not in skipped,
-                                                    "reason": skipped.get(sg["id"], "inside the clips given to Gemini")},
+                                                    "reason": skipped.get(sg["id"], "inside the clips given to the AI")},
             "proposals": proposals})
     return {
         "schema": "hookline.segment_recommendations", "video_id": dr["video_id"], "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": STATUS, "source": dr["source"], "evidence_availability": dr["evidence_availability"],
         "gemini": {"used": usable, "stale": stale, "status": (gem or {}).get("status"),
-                   "reason": ("an earlier Gemini analysis exists but was made for a different TTCC curve, so it is not attached; rerun the Gemini step"
+                   "reason": ("an earlier AI analysis exists but was made for a different TTCC curve, so it is not attached; rerun the AI step"
                               if stale else (gem or {}).get("reason")), "model": (gem or {}).get("model"),
                    "scope": None if not scope else {k: scope.get(k) for k in ("whole_predicted_span", "clips_s", "analysed_s", "max_analysed_s",
                                                                               "predicted_span_s", "not_analysed")},

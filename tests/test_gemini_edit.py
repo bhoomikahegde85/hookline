@@ -352,14 +352,14 @@ def test_page_shows_gemini_and_its_trims_work_in_chrome(tmp_path) -> None:
     write_gemini_edit(d, art)
     page = build_review(d, video)
     html = page.read_text()
-    assert ENV["GEMINI_API_KEY"] not in html and "Gemini overview" in html and "Gemini (model interpretation, hypothesis)" in html
+    assert ENV["GEMINI_API_KEY"] not in html and "AI overview" in html and "AI (model interpretation, hypothesis)" in html and "Gemini" not in html
     data = json.loads(html.split('type="application/json">')[1].split("</script>")[0].replace("<\\/", "</"))
     assert data["gemini_info"]["used"] and any(c["source"] == "gemini" and c["edit"]["action"] == "trim" for iv in data["intervals"] for c in iv["candidate_causes"])
     out = subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--virtual-time-budget=5000", "--dump-dom", page.resolve().as_uri() + "#selftest"],
                          capture_output=True, text=True, timeout=120).stdout
     m = re.search(r'<pre id="selftest">(.*?)</pre>', out, re.S)
     assert m and m.group(1).startswith("SELFTEST PASS") and "accepted trim reaches the export" in m.group(1), m.group(1) if m else "page script did not run"
-    assert "Gemini overview" in out and "Gemini: what it observed" in out  # rendered into the DOM, not only present in the source
+    assert "AI overview" in out and "AI: what it observed" in out  # rendered into the DOM, not only present in the source
 
 
 def test_e2e_gemini_step_is_required_and_gated(tmp_path) -> None:
@@ -371,7 +371,7 @@ def test_e2e_gemini_step_is_required_and_gated(tmp_path) -> None:
     steps = e2e.plan(tmp_path / "FC002.mp4", tmp_path, gemini_allow_remote=True, **base)
     assert len(steps) == 9  # Gemini is always part of the plan
     g = steps[3]
-    assert "Gemini" in g["name"] and not g.get("optional") and "--gemini-allow-remote" in g["cmd"] and g["cmd"][g["cmd"].index("--gemini-approve") + 1] == "FC002"
+    assert g["name"].startswith("explanation") and "Gemini" not in g["name"] and not g.get("optional") and "--gemini-allow-remote" in g["cmd"] and g["cmd"][g["cmd"].index("--gemini-approve") + 1] == "FC002"
     assert "run_gemini_edit.py" in g["cmd"][1] and ".venv-models/" in g["cmd"][0] and steps[4]["name"].startswith("music") and steps[5]["name"].startswith("popularity") and steps[6]["name"].startswith("scores") and steps[7]["name"].startswith("explain") and steps[8]["name"].startswith("segments")
     assert e2e.plan(tmp_path / "v.mp4", tmp_path, **base)[3]["skip"]  # no upload permission, no step
     calls = []
