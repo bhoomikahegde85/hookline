@@ -214,7 +214,7 @@ class SiglipConfig:
         return d | {"hookline_siglip_version": SIGLIP_VERSION}
 
 
-GEMINI_EDIT_VERSION = "2"  # prompt + schema + validation + analysed clip selection of the segment interpretation (gemini_edit.json)
+GEMINI_EDIT_VERSION = "4"  # prompt + schema + validation + analysed clip selection of the segment interpretation (gemini_edit.json)
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"  # what this project used before; override with GEMINI_MODEL if your key serves another Flash model
 TRIBE_VERSION = "1"  # Hookline-side request/artifact schema for TRIBE v2
 TRIBE_MODEL_REPO = "facebook/tribev2"

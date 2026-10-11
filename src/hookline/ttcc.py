@@ -164,6 +164,29 @@ def hook_metrics(retention: list[float], shown_s: float | None = None) -> dict:
                  "meaning": "TTCC prediction of the share of viewers still watching (viewers who start at 0); not measured retention"}
 
 
+DECODABLE_CODECS = ("h264", "hevc", "mpeg4")  # the runner's video reader reports no frame rate for some others (VP9, AV1): 4 of 110 reels failed with KeyError 'video_fps'
+
+
+def video_codec(path: Path) -> str | None:
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, timeout=60).stdout.strip().splitlines()
+        return out[0].strip().lower() if out else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def normalised_copy(src: Path, dst: Path) -> Path:
+    """H.264, constant 30 fps, no audio (TTCC runs with audio off), at most 540 px wide (the model sees about 224 px frames; full-size 1080p frames ran out of
+    GPU memory in the decoder): same pictures and timeline, a codec every reader handles."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".part.mp4")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-an", "-vf", "scale=min(iw\\,540):-2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                    "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart", str(tmp)], check=True, timeout=1800)
+    tmp.replace(dst)
+    return dst
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -558,6 +581,8 @@ class TtccJob:
     window_end: float | None = None  # only the first window_end seconds were shown to the model
     key: str | None = None
     plan: list | None = None  # long_videos="windows": [(start_s, end_s), ...] on the original timeline
+    runner_path: Path | None = None  # the file actually sent to the runner: a normalised copy when the source codec is not decodable by the runner
+    normalised: str | None = None
 
 
 def _status(job: TtccJob, status: str, reason: str | None, stage: str, **extra) -> dict:
@@ -594,7 +619,7 @@ def _artifact(job: TtccJob, cfg: TtccConfig, raw: dict, curve: dict, raw_sha: st
         "model": {"name": "TTCC", "checkpoint_repo": cfg.checkpoint_repo, "checkpoint_revision": cfg.checkpoint_revision,
                   "model_type": "qwen2_5_omni_retention", "head_type": cfg.head_type, "base_model": "Qwen/Qwen2.5-Omni-3B",
                   "upstream": f"{TTCC_UPSTREAM_REPO}@{TTCC_UPSTREAM_BRANCH}"},
-        "convention": CONVENTION,
+        "convention": CONVENTION, "input": {"normalised": job.normalised},
         "timestamps_s": curve["timestamps_s"],
         "retention": curve["retention"],
         "summary": curve["summary"],
@@ -699,7 +724,7 @@ def run_windowed(job: TtccJob, cfg: TtccConfig, runner: Runner, runtime: dict, p
                                "allow_download": cfg.allow_download, "expected_files": {k: list(v) for k, v in TTCC_CHECKPOINT_FILES.items()},
                                "verify_weights_sha256": cfg.verify_weights_sha256},
                 "settings": cfg.inference_settings(**runtime), "prompts": PROMPTS,
-                "jobs": [{"video_id": window_id(job.video_id, s, e), "video_path": str(job.source_path.resolve()), "T": e - s,
+                "jobs": [{"video_id": window_id(job.video_id, s, e), "video_path": str((job.runner_path or job.source_path).resolve()), "T": e - s,
                           "video_start": float(s), "video_end": float(e), "shrink_to_fit": False,
                           "raw_output": str((workdir / "raw" / f"{window_id(job.video_id, s, e)}.json").resolve())} for s, e, _ in todo]}
             log(f"ttcc: {job.video_id}: {len(plan)} window(s) of {W} s every {stride} s over {n} s; running {len(todo)} "
@@ -768,6 +793,10 @@ def run_windowed(job: TtccJob, cfg: TtccConfig, runner: Runner, runtime: dict, p
             "limitation": ("Approximation: window k predicts viewers who start watching at its start, the merged curve describes viewers who "
                            "started at 0. Not validated against audience data."),
         })
+    first = ordered[0]
+    if first["start"] == 0:  # the first window is a native, start-anchored prediction: the hook, read before any blending
+        art["hook"] = hook_metrics(first["retention"]) | {"native": True, "from_window": [first["start"], first["end"]]}
+    art["policy"] = "windows"
     art["inference"].update(window_end_s=None, window_fit=None, input_tokens=[r["raw"].get("input_tokens") for r in ordered],
                             inference_seconds=round(sum((r["raw"].get("inference_seconds") or 0.0) for r in ordered), 3),
                             deviations_from_upstream_eval=art["inference"]["deviations_from_upstream_eval"] + [
@@ -878,6 +907,18 @@ def run_ttcc(videos: list, root: Path, cfg: TtccConfig, runner: Runner | None = 
         pending = allowed
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:6]
     workdir = root / "cache" / "_ttcc_runs" / run_id
+    for job in pending:  # a codec the runner cannot read is converted once (the original file and its hash stay the identity)
+        codec = video_codec(job.source_path)
+        if codec and codec not in DECODABLE_CODECS:
+            try:
+                job.runner_path = normalised_copy(job.source_path, root / "cache" / "_ttcc_norm" / f"{job.video_id}.mp4")
+                job.normalised = f"{codec} -> h264, constant 30 fps, no audio"
+                log(f"ttcc: {job.video_id}: {codec} is not read by the runner; sending an H.264 copy")
+            except (subprocess.SubprocessError, OSError) as exc:
+                _status(job, FAILED, f"could not convert the {codec} video to H.264: {exc}", "normalise")
+    pending = [j for j in pending if j.record.get("status") != FAILED]
+    if not pending:
+        return {"records": [j.record for j in jobs], "batch": batch}
     for job in [j for j in pending if j.plan and len(j.plan) > 1]:
         run_windowed(job, cfg, runner, runtime, probe, workdir, force, log, batch)
     pending = [j for j in pending if not (j.plan and len(j.plan) > 1)]
@@ -893,7 +934,7 @@ def run_ttcc(videos: list, root: Path, cfg: TtccConfig, runner: Runner | None = 
                        "verify_weights_sha256": cfg.verify_weights_sha256},
         "settings": cfg.inference_settings(**runtime),
         "prompts": PROMPTS,
-        "jobs": [{"video_id": j.video_id, "video_path": str(j.source_path.resolve()), "T": j.T, "video_end": j.window_end,
+        "jobs": [{"video_id": j.video_id, "video_path": str((j.runner_path or j.source_path).resolve()), "T": j.T, "video_end": j.window_end,
                   "shrink_to_fit": cfg.long_videos == "first_60s" or (cfg.long_videos == "hook" and cfg.hook_prompt_s is None),
                   "raw_output": str((workdir / "raw" / f"{j.video_id}.json").resolve())} for j in pending],
     }
@@ -934,7 +975,7 @@ def run_ttcc(videos: list, root: Path, cfg: TtccConfig, runner: Runner | None = 
         shutil.copyfile(raw_path, job.out_dir / RAW_FILE)
         raw_sha = file_sha256(job.out_dir / RAW_FILE)
         art = _artifact(job, cfg, raw, curve, raw_sha, job.record.get("duration_s"), runtime, probe)
-        art["hook"] = hook_metrics(curve["retention"], job.window_end)
+        art["hook"] = hook_metrics(curve["retention"], job.window_end) | {"native": True}
         art["policy"] = cfg.long_videos
         if cfg.long_videos == "hook" and job.window_end is not None and job.T != round(job.window_end):
             art["inference"]["deviations_from_upstream_eval"].append(

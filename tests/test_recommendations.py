@@ -128,3 +128,6 @@ def test_repeated_text_cites_both_ocr_events() -> None:
     assert invalid_evidence(recs, evidence_index(rows(), [], o, None)) == []
     assert "repeated_text" not in rules(build_recommendations(rows(), [], {**o, "measured": False, "status": "failed"}, None, 6.0))
     assert "repeated_text" not in rules(build_recommendations(rows(), [], None, None, 6.0))
+    words = [{"event_id": 10 + i, "text": w, "first_seen_s": float(i), "visible_until_s": i + 1.0, "repeat_of": None} for i, w in enumerate(["the", "bag", "is", "big", "and", "light"])]
+    caps = {**o, "events": words + [{"event_id": 20, "text": "the", "first_seen_s": 4.0, "visible_until_s": 5.0, "repeat_of": 10}]}
+    assert "repeated_text" not in rules(build_recommendations(rows(), [], caps, None, 6.0))  # word-by-word captions repeat common words

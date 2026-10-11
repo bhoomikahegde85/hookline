@@ -24,6 +24,32 @@ from .segment_recommendations import build_segment_recommendations
 from .ttcc import hook_metrics
 
 REVIEW_FILE = "review.html"
+REFERENCE_CURVES = Path(__file__).resolve().parents[2] / "artifacts" / "hook" / "features"  # TTCC predictions of the 100+ reference reels
+BAND_MIN_REELS = 30
+# TTCC's prediction for a video whose frames are all black (the first 10 s). Measured on 3 reels in the sanity run 20261010T183353Z; the three
+# curves were identical, so it is the model's content-free baseline. A real video's curve is read against it: above means TTCC sees content it likes.
+BLANK_VIDEO_CURVE = [1.0, 0.3655, 0.2135, 0.17, 0.1381, 0.1196, 0.1014, 0.0883, 0.078, 0.0717, 0.0654]
+
+
+def reference_band(root: Path | None = None) -> dict | None:
+    """Per-second 10th / 50th / 90th percentile of the reference reels' predicted retention (native pass), where at least BAND_MIN_REELS
+    reels have a value. TTCC curves are close to one shared decay shape, so a video's curve is read against this band."""
+    import numpy as np
+    root = REFERENCE_CURVES if root is None else root
+    curves = []
+    for f in sorted(root.glob("*/ttcc_retention.json")) if root.is_dir() else []:
+        a = _load(f)
+        if a and a.get("status") == "success" and a.get("retention"):
+            curves.append(a["retention"])
+    if len(curves) < BAND_MIN_REELS:
+        return None
+    t_max = 0
+    while sum(len(c) > t_max + 1 for c in curves) >= BAND_MIN_REELS:
+        t_max += 1
+    cols = [[c[t] for c in curves if len(c) > t] for t in range(t_max + 1)]
+    q = lambda p: [round(float(np.percentile(v, p)), 4) for v in cols]  # noqa: E731
+    return {"n_reels": len(curves), "p10": q(10), "p50": q(50), "p90": q(90), "blank": BLANK_VIDEO_CURVE,
+            "note": "10th-90th percentile and median of TTCC's predicted retention on the reference reels (native pass); predictions, not audience data"}
 
 
 def _load(path: Path):
@@ -35,7 +61,27 @@ def _load(path: Path):
 
 def _embed(data: dict) -> str:
     """JSON safe inside a <script> tag."""
-    return json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\!--")
+    return json.dumps(data, ensure_ascii=False).replace("<", "\\u003c")
+
+
+def curve_audit(art: dict, video_dir: Path) -> dict:
+    """Facts about the displayed curve, so what processing was (not) applied can be shown: nothing is smoothed or normalised here."""
+    import numpy as np
+    r = np.asarray(art.get("retention") or [], float)
+    ts = art.get("timestamps_s") or []
+    out = {"displayed_curve": "TTCC output as returned: Hookline applies no smoothing or rescaling (R(0)=1 is prepended by convention; raw values are in raw_file)",
+           "points": int(len(r)), "grid_s": 1.0, "timestamps_are_whole_seconds_from_0": ts == list(range(len(r))),
+           "non_increasing": bool((np.diff(r) <= 1e-9).all()) if len(r) > 1 else None,
+           "values_in_0_1": bool(((r >= 0) & (r <= 1)).all()) if len(r) else None,
+           "raw_file": "ttcc_raw.json" if (video_dir / "ttcc_raw.json").is_file() else None,
+           "merge": "10 s windows every 5 s merged in hazard space (approximate)" if art.get("stitched") else "single native pass"}
+    if art.get("stitched") and len(r) > 12:
+        h = -np.log(np.maximum(r[1:], 1e-9) / np.maximum(r[:-1], 1e-9))
+        dh = np.abs(np.diff(h))
+        seam = np.arange(2, len(r))[: len(dh)] % 5 == 0
+        if seam.any() and (~seam).any():
+            out["hazard_change_at_window_seams_vs_elsewhere"] = [round(float(dh[seam].mean()), 4), round(float(dh[~seam].mean()), 4)]
+    return out
 
 
 def build_review(video_dir: Path, video_path: Path | None = None) -> Path | None:
@@ -43,7 +89,7 @@ def build_review(video_dir: Path, video_path: Path | None = None) -> Path | None
     dr, art = _load(video_dir / "ttcc_dropoffs.json"), _load(video_dir / "ttcc_retention.json")
     if not dr or not art:
         return None
-    rec = build_segment_recommendations(video_dir)  # TTCC segments + rule proposals + Gemini (when it ran)
+    rec = build_segment_recommendations(video_dir)  # TTCC segments + rule proposals + Gemini
     cards = []
     for sg in rec["segments"]:
         if sg["kind"] == "unflagged" and not sg["proposals"] and not sg["gemini"]:
@@ -63,6 +109,10 @@ def build_review(video_dir: Path, video_path: Path | None = None) -> Path | None
         "deviations": (art.get("inference") or {}).get("deviations_from_upstream_eval") or [],
         "hook": art.get("hook") or hook_metrics(art["retention"], (art.get("inference") or {}).get("window_end_s")),
         "stitched": bool(art.get("stitched")),
+        "scores": _load(video_dir / "hook_scores.json"),  # written by scripts/score_video.py; absent until it has run
+        "hook_report": _load(video_dir / "hook_report.json"),  # scripts/explain_video.py: why the hook is strong or weak
+        "moments": _load(video_dir / "moments.json"),
+        "ref_band": reference_band(), "curve_audit": curve_audit(art, video_dir), "stems": _load(video_dir / "stems.json"), "inference": art.get("inference"), "ttcc_status": _load(video_dir / "ttcc_status.json"),  # shown on the Diagnostics view only  # scripts/explain_video.py: strongest and weakest moments
     }
     path = video_dir / REVIEW_FILE
     path.write_text(PAGE.replace("__DATA__", _embed(data)))
@@ -107,6 +157,17 @@ header.top{display:flex;align-items:flex-start;gap:16px;margin-bottom:14px}heade
 .tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.tile{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;cursor:pointer}
 .tile:hover{border-color:var(--line2)}.tile .t{font:11px var(--mono);color:var(--mut);letter-spacing:.5px}.tile .v{font:600 22px var(--mono);margin-top:2px}.tile .bar{height:4px;border-radius:3px;background:var(--line);margin-top:8px;overflow:hidden}
 .tile .bar b{display:block;height:100%;background:var(--c,var(--g))}
+.gauges{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gauge{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.gauge svg{width:96px;height:96px;margin:0 auto}.gauge .gl{font:600 12px var(--mono);letter-spacing:.6px;color:var(--mut);margin-top:6px}.gauge .gv{font:650 11.5px var(--mono);color:var(--fg);margin-top:2px}
+.gauge .ga{font-size:11.5px;color:var(--mut);margin-top:6px;line-height:1.35}.gauge.weak .ga b{color:var(--y)}.gauge.ok .ga b{color:var(--g)}
+.verdict{display:flex;align-items:center;gap:12px;margin:12px 0 6px}.vb{padding:5px 14px;border-radius:999px;font:700 13px var(--mono);letter-spacing:.8px;border:1px solid}
+.vb.strong{color:var(--g);border-color:color-mix(in srgb,var(--g) 50%,transparent);background:color-mix(in srgb,var(--g) 10%,transparent)}.vb.weak{color:var(--r);border-color:color-mix(in srgb,var(--r) 50%,transparent);background:color-mix(in srgb,var(--r) 10%,transparent)}
+.vb.average,.vb.notrated{color:var(--y);border-color:color-mix(in srgb,var(--y) 50%,transparent);background:color-mix(in srgb,var(--y) 8%,transparent)}
+.cols2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fcard{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--c,var(--line2));border-radius:10px;padding:9px 11px;margin:6px 0;font-size:12.5px}
+.fcard b{display:block;font-size:13px}.fcard .why{color:var(--mut);margin-top:3px}.moments{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.mcol h3{margin:0 0 6px;font-size:13px;font-weight:600}.mcol.good h3{color:var(--g)}.mcol.bad h3{color:var(--r)}.mcard{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--c);border-radius:10px;padding:10px 12px;margin:8px 0;cursor:pointer}
+.mcard:hover{border-color:var(--line2)}.mcard .tm{font:650 14px var(--mono)}.mcard ul{margin:4px 0 2px 16px;padding:0;font-size:12.5px}.mcard .act{margin-top:6px;font-size:12.5px;color:#e3d2fd}
+.wtable td.pos{color:var(--g)}.wtable td.neg{color:var(--r)}.wtable td.noise{color:var(--mut)}
 /* chart + strip + film */
 svg{width:100%;height:auto;display:block}
 #strip{position:relative;height:12px;border-radius:999px;background:var(--panel2);overflow:hidden;cursor:pointer;margin:10px 0 8px;border:1px solid var(--line)}
@@ -150,24 +211,67 @@ table{border-collapse:collapse;width:100%;font-size:12.5px}td,th{padding:6px 8px
 tr.row{cursor:pointer}tr.row:hover{background:var(--panel2)}.pill{display:inline-block;padding:1px 8px;border-radius:999px;border:1px solid var(--line2);font-size:11.5px;color:var(--c,var(--fg))}
 .bar{display:inline-block;height:6px;background:var(--c,#6b7280);border-radius:4px;vertical-align:middle;margin-right:6px}
 details summary{cursor:pointer;color:var(--mut);font-size:13px}
+@media (max-width:760px){.cols2,.moments{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:640px){.gauges{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:1180px){.grid{grid-template-columns:minmax(0,1fr)}.sticky{position:static}}
 @media (max-width:860px){.app{grid-template-columns:minmax(0,1fr)}aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;padding:12px 16px;gap:10px}
 nav{flex-direction:row;flex-wrap:wrap}nav a{padding:5px 9px}nav a span.k{display:none}.side-foot{display:none}main{padding:14px 16px 32px;overflow-x:hidden}
 header.top{flex-wrap:wrap}.top .right{margin-left:0}.panel{padding:13px}.panel h2{flex-wrap:wrap}.legend{margin-left:0}.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
 .film{grid-auto-flow:row;grid-template-columns:repeat(4,minmax(0,1fr))}.srow{grid-template-columns:12px auto minmax(0,1fr) auto;gap:8px;padding:10px 4px}.srow .ds{display:none}.srow .lb{font-size:12.5px}
 .status{flex-direction:column;gap:2px}.dhead .tm{font-size:17px}}
+/* polish layer: aurora backdrop, glass panels, glow, motion */
+body{background:radial-gradient(900px 500px at 85% -10%,rgba(180,124,240,.16),transparent 60%),radial-gradient(700px 420px at 0% 10%,rgba(95,211,138,.10),transparent 60%),radial-gradient(800px 500px at 60% 110%,rgba(255,84,104,.08),transparent 60%),var(--bg);background-attachment:fixed}
+::selection{background:color-mix(in srgb,var(--p) 40%,transparent)}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px;border:2px solid var(--bg)}::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+aside{background:linear-gradient(180deg,rgba(18,21,32,.85),rgba(10,12,18,.9));backdrop-filter:blur(14px)}
+.brand b{background:linear-gradient(90deg,#fff,#d9c3fb 60%,var(--g));-webkit-background-clip:text;background-clip:text;color:transparent}
+.mark i{box-shadow:0 0 10px currentColor;animation:eq 1.6s ease-in-out infinite alternate}.mark i:nth-child(1){color:var(--g)}.mark i:nth-child(2){color:var(--p);animation-delay:.2s}.mark i:nth-child(3){color:var(--r);animation-delay:.4s}.mark i:nth-child(4){color:var(--y);animation-delay:.6s}
+@keyframes eq{from{transform:scaleY(.65);transform-origin:bottom}to{transform:scaleY(1);transform-origin:bottom}}
+nav a{transition:all .18s}nav a.on{background:linear-gradient(90deg,color-mix(in srgb,var(--p) 22%,transparent),transparent);border-color:color-mix(in srgb,var(--p) 40%,transparent);box-shadow:inset 3px 0 0 var(--p)}
+header.top h1{font-size:25px;background:linear-gradient(90deg,#fff 30%,#cdb0f7);-webkit-background-clip:text;background-clip:text;color:transparent}
+.chip.pred{box-shadow:0 0 18px color-mix(in srgb,var(--g) 25%,transparent)}.chip.pred::first-letter{animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25}}
+.panel{background:linear-gradient(160deg,rgba(24,28,43,.78),rgba(14,17,26,.82));border-color:rgba(120,130,170,.16);border-radius:18px;box-shadow:0 10px 34px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.04);backdrop-filter:blur(10px);animation:rise .5s ease both;transition:border-color .2s,box-shadow .2s}
+.panel:hover{border-color:color-mix(in srgb,var(--p) 35%,var(--line));box-shadow:0 12px 40px rgba(0,0,0,.42),0 0 0 1px color-mix(in srgb,var(--p) 14%,transparent)}
+.col>.panel:nth-child(2){animation-delay:.06s}.col>.panel:nth-child(3){animation-delay:.12s}.col>.panel:nth-child(4){animation-delay:.18s}.col>.panel:nth-child(5){animation-delay:.24s}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.panel h2{font-size:16px;letter-spacing:.2px}.panel h2::before{content:"";width:4px;height:16px;border-radius:3px;background:linear-gradient(180deg,var(--p),var(--g))}
+.player{border-radius:14px;box-shadow:0 0 0 1px rgba(255,255,255,.06),0 14px 40px rgba(0,0,0,.55)}
+.tile,.gauge,.fcard,.mcard,.sug{border-radius:14px;transition:transform .16s,border-color .16s,box-shadow .16s;background:linear-gradient(160deg,rgba(30,35,54,.7),rgba(18,21,32,.8))}
+.tile:hover,.mcard:hover,.gauge:hover{transform:translateY(-2px);border-color:var(--p);box-shadow:0 8px 24px rgba(0,0,0,.4),0 0 18px color-mix(in srgb,var(--p) 20%,transparent)}
+.tile .v{font-size:26px;background:linear-gradient(180deg,#fff,#b9bfd6);-webkit-background-clip:text;background-clip:text;color:transparent}
+.tile .bar,.rbar{height:5px}.tile .bar b{background:linear-gradient(90deg,var(--c,var(--g)),color-mix(in srgb,var(--c,var(--g)) 50%,#fff));box-shadow:0 0 10px var(--c,var(--g))}
+.gauge svg{filter:drop-shadow(0 0 10px color-mix(in srgb,var(--p) 35%,transparent))}
+.vb{box-shadow:0 0 22px currentColor;text-shadow:0 0 10px currentColor}
+#strip{height:14px;box-shadow:inset 0 1px 3px rgba(0,0,0,.5)}#strip .head{box-shadow:0 0 12px #fff,0 0 4px var(--p)}#strip .seg{box-shadow:0 0 10px var(--c)}
+.film .fr{transition:transform .15s,border-color .15s}.film .fr:hover{transform:translateY(-2px) scale(1.03);border-color:var(--p)}.film .fr.on{box-shadow:0 0 16px color-mix(in srgb,var(--p) 55%,transparent)}
+button{transition:all .15s;border-radius:10px}button:hover{transform:translateY(-1px);box-shadow:0 6px 18px color-mix(in srgb,var(--p) 25%,transparent)}button:active{transform:none}
+button.primary{background:linear-gradient(135deg,#7c4dff,#b47cf0 55%,#e07cf0);box-shadow:0 6px 22px color-mix(in srgb,var(--p) 40%,transparent);font-weight:600}
+.srow{transition:background .15s,transform .15s}.srow:hover{transform:translateX(3px)}.srow.on{background:linear-gradient(90deg,color-mix(in srgb,var(--c) 14%,transparent),var(--panel2))}
+.badge{box-shadow:0 0 14px color-mix(in srgb,var(--c) 30%,transparent)}
+.banner{border-radius:14px;background:linear-gradient(90deg,rgba(255,207,71,.08),var(--panel) 40%)}
+/* views */
+body[data-view="analysis"] [data-view]:not([data-view~="analysis"]){display:none}
+body[data-view="insights"] [data-view]:not([data-view~="insights"]){display:none}
+body[data-view="edit"] [data-view]:not([data-view~="edit"]){display:none}
+body[data-view="diagnostics"] [data-view]:not([data-view~="diagnostics"]){display:none}
+body[data-view="analysis"] .grid,body[data-view="diagnostics"] .grid{grid-template-columns:minmax(0,1fr)}
+body[data-view="analysis"] #hookwhy,body[data-view="analysis"] #hooknote{display:none!important}
+body[data-view="analysis"] video{height:min(62vh,620px)}
+.tsug{display:grid;grid-template-columns:1fr auto;gap:6px 14px;padding:11px 4px;border-top:1px solid var(--line)}.tsug:first-child{border-top:0}
+.tsug b{font-size:13.5px}.tsug .why{grid-column:1;color:var(--mut);font-size:12.5px}.tsug .acts{grid-column:2;grid-row:1/3;display:flex;gap:8px;align-items:center}
+.tag{font:600 11px var(--mono);color:var(--mut);margin-right:6px}.tag.ai{color:var(--p)}
+#diagbody h3{font-size:13px;margin:14px 0 4px}#diagbody pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto;font:11.5px var(--mono);max-height:260px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div class="app">
 <aside>
   <div class="brand"><div class="mark"><i></i><i></i><i></i><i></i></div><b>Hookline</b><span class="by"><span class="w">W</span><span class="l">L</span><span class="d1">D</span><span class="d2">D</span></span></div>
   <nav id="nav">
-    <a href="#editor" class="on">Editor<span class="k">E</span></a>
-    <a href="#hookpanel">Hook<span class="k">0–10s</span></a>
-    <a href="#retention">Retention<span class="k">R(t)</span></a>
-    <a href="#segments">Segments<span class="k" id="navsegs"></span></a>
-    <a href="#scores">Scores</a>
-    <a href="#exports">Export</a>
-    <a href="#seconds">Second by second</a>
+    <a href="#analysis" data-v="analysis">Analysis</a>
+    <a href="#insights" data-v="insights">Insights</a>
+    <a href="#edit" data-v="edit">Edit Review<span class="k" id="navsegs"></span></a>
+    <a href="#diagnostics" data-v="diagnostics">Diagnostics</a>
   </nav>
   <div class="side-foot" id="sidefoot"></div>
 </aside>
@@ -176,51 +280,80 @@ header.top{flex-wrap:wrap}.top .right{margin-left:0}.panel{padding:13px}.panel h
   <div><h1 id="title">Hookline editing assistant</h1><div class="meta" id="meta"></div></div>
   <div class="right"><span class="chip pred" title="TTCC model prediction, not measured audience data">● Predicted retention</span><button class="primary" id="topexport">Export ↓</button></div>
 </header>
-<div class="banner" id="banner"></div>
+<div class="banner" data-view="analysis" id="banner"></div>
 <div class="grid">
 <div class="col">
-  <section class="panel">
+  <section class="panel" data-view="analysis edit">
     <div class="player"><video id="v" controls preload="metadata"></video></div>
     <p class="mut" id="vnote" style="margin:6px 2px 0"></p>
     <div class="status"><span id="now" class="mono">0:00</span><span id="activeinfo" class="mut"></span></div>
   </section>
-  <section class="panel" id="hookpanel">
+  <section class="panel" data-view="insights" id="scorespanel" style="display:none">
+    <h2>Scores</h2>
+    <div class="gauges" id="gauges"></div>
+  </section>
+  <section class="panel" data-view="analysis insights" id="hookpanel">
     <h2>Hook: is the opening predicted to hold?</h2>
     <p class="sub">Share of viewers TTCC predicts are still watching at each second (viewers who start at 0). A model prediction, not audience data.</p>
     <div class="tiles" id="tiles"></div>
     <p class="mut" id="hooknote" style="margin:8px 0 0"></p>
+    <div id="hookwhy" style="display:none"></div>
   </section>
-  <section class="panel" id="retention">
+  <section class="panel" data-view="analysis edit" id="retention">
     <h2>Predicted viewer retention <span class="legend"><span><i style="background:var(--g)"></i>Holds</span><span><i style="background:var(--y)"></i>Decline</span><span><i style="background:var(--r)"></i>Steep drop</span></span></h2>
     <p class="sub">Click the curve, the bar or a frame to jump. The white line follows the video.</p>
     <svg id="chart" viewBox="0 0 760 250" role="img" aria-label="Predicted retention curve"></svg>
+    <div class="row-actions" style="margin-top:6px"><button class="small" id="logtoggle">Zoom into the tail (log scale)</button></div>
+    <p id="bandverdict" style="display:none;margin:6px 0 0;font-size:13px"></p>
+    <p class="mut" id="logscalenote" style="display:none;margin:4px 0 0">Log scale: each gridline is ten times smaller than the one above. It shows the shape of the small remaining share; it does not change the prediction.</p>
     <div id="strip" title="Click to jump"></div>
     <div class="film" id="film"></div>
     <div class="row-actions"><button class="primary" id="playedited">▶ Play edited version (skips accepted trims)</button><span class="mut" id="editedinfo"></span></div>
   </section>
-  <section class="panel" id="segments">
+  <section class="panel" data-view="analysis" id="topsugs">
+    <h2>Top suggested edits</h2>
+    <p class="sub">AI SUGGESTION = written by Gemini after watching and listening to the video; RULE-BASED = a fixed rule over measured features. Neither is tested on real audience data, so treat them as ideas to check. Inspect the evidence, or review the trim in Edit Review.</p>
+    <div id="topsugslist"></div>
+  </section>
+  <section class="panel" data-view="insights" id="momentspanel" style="display:none">
+    <h2>Strongest and weakest moments</h2>
+    <p class="sub" id="momentssub"></p>
+    <div class="moments" id="moments"></div>
+  </section>
+  <section class="panel" data-view="edit" id="whatifpanel">
+    <h2>What if I make these edits?</h2>
+    <p class="sub">Accept trims below, then predict the edited video with the same model. A model prediction of the edited cut, not audience data.</p>
+    <div class="row-actions" style="margin-top:0"><button id="acceptall">Accept all suggested trims</button><button class="primary" id="whatifgo" disabled>Predict the edited version</button><span class="mut" id="whatifmsg"></span></div>
+    <div id="whatifout" style="display:none"></div>
+  </section>
+  <section class="panel" data-view="insights" id="segments">
     <h2>Video segments &amp; recommendations</h2>
     <p class="sub">The predicted span split into consecutive segments. Select one to see its evidence and the proposed edits.</p>
     <div class="seglist" id="seglist"></div>
   </section>
-  <section class="panel" id="scores">
+  <section class="panel" data-view="diagnostics" id="scores">
     <h2>Scores per segment</h2>
     <p class="sub">Two different kinds of number, never combined: <b>predicted retention fall</b> (TTCC model prediction) and <b>heuristic risk / quality</b> (0–100, hand-set rules over measured features). Neither is audience data.</p>
     <div style="overflow-x:auto"><table id="segscores"><thead><tr><th>Segment</th><th>Type</th><th>Predicted R</th><th>Predicted fall (share)</th><th>Rank</th><th>Heuristic risk mean / max</th><th>Heuristic quality mean / max</th><th></th></tr></thead><tbody></tbody></table></div>
     <div class="row-actions"><button id="exportsegs">Export segment scores (CSV)</button></div>
   </section>
-  <section class="panel" id="gemsec"><div id="geminibox"></div></section>
-  <section class="panel" id="exports">
+  <section class="panel" data-view="insights" id="gemsec"><div id="geminibox"></div></section>
+  <section class="panel" data-view="edit" id="exports">
     <h2>Export</h2><p class="sub">Your decisions stay in this browser until you export them. Nothing is uploaded.</p>
     <div class="row-actions" style="margin-top:4px"><button class="primary" id="exportjson">Export edit decisions (JSON)</button><button class="primary" id="exportcsv">Export edit decisions (CSV)</button><button id="clear">Clear my decisions</button><span class="mut" id="saved"></span></div>
   </section>
-  <section class="panel" id="seconds">
+  <section class="panel" data-view="diagnostics" id="diag">
+    <h2>Model and pipeline diagnostics</h2>
+    <p class="sub">Technical detail kept off the main screens.</p>
+    <div id="diagbody"></div>
+  </section>
+  <section class="panel" data-view="diagnostics" id="seconds">
     <details><summary>Second by second (predicted R(t), drop, class, what was measured)</summary>
     <div style="overflow-x:auto;margin-top:8px"><table id="secs"><thead><tr><th>t</th><th>R(t) predicted</th><th>drop</th><th>class</th><th>measured in that second</th></tr></thead><tbody></tbody></table></div></details>
   </section>
   <p class="mut" id="foot"></p>
 </div>
-<div class="col">
+<div class="col" data-view="insights edit" id="detailcol">
   <section class="panel sticky" id="detail">
     <h2>Segment analysis <span class="legend mono" id="detailpos"></span></h2>
     <div id="segs"></div>
@@ -239,7 +372,7 @@ const fmt=(t)=>{const m=Math.floor(t/60),s=t-60*m;return m+':'+(s<10?'0':'')+s.t
 const mmss=(t)=>{t=Math.round(t);return Math.floor(t/60)+':'+String(t%60).padStart(2,'0');};
 const pc=(r)=>r==null?'–':Math.round(100*r)+'%';
 const V=$('v'),TOTAL=D.duration_s||D.horizon_s;
-const SERVED=location.protocol==='http:'||location.protocol==='https:';const SRC=SERVED?'video':D.video_url;  // served by scripts/serve_review.py, or the file:// path
+const SERVED=location.protocol==='http:'||location.protocol==='https:';const SRC=SERVED?'video':null;  // served by scripts/serve_review.py, or the file:// path
 const DISCLAIMER='PREDICTED retention from a pretrained model (TTCC). Not actual audience data; its accuracy on these videos has not been verified. Suggestions are unvalidated rules over measured features.';
 const COLOR={steep_drop:'#ff5468',sustained_decline:'#ffcf47',holds:'#5fd38a',unflagged:'#5b6276'};
 // ---- pure helpers (also exercised by the self-test)
@@ -252,7 +385,7 @@ const KEY='hookline-assistant:'+(D.sha256||D.video_id);let store={};try{store=JS
 const persist=()=>{try{localStorage.setItem(KEY,JSON.stringify(store));$('saved').textContent='saved in this browser';}catch(e){$('saved').textContent='could not save in this browser; export instead';}};
 const SUGS=[];D.intervals.forEach(iv=>iv.candidate_causes.forEach((c,i)=>SUGS.push({id:iv.id+':'+c.rule+':'+i,iv,c})));
 function cur(sg){const s=store[sg.id]||{};return{decision:s.decision||'undecided',note:s.note||'',a:s.a!=null?s.a:sg.c.edit.start_s,b:s.b!=null?s.b:sg.c.edit.end_s};}
-function acceptedTrims(){return SUGS.filter(sg=>sg.c.edit.action==='trim').map(sg=>({sg,s:cur(sg)})).filter(x=>x.s.decision==='accepted'&&x.s.b>x.s.a).map(x=>({a:x.s.a,b:x.s.b})).sort((p,q)=>p.a-q.a);}
+function acceptedTrims(){return SUGS.filter(sg=>sg.c.edit.action==='trim').map(sg=>({sg,s:cur(sg)})).filter(x=>x.s.decision==='accepted'&&x.s.b>x.s.a).map(x=>({a:x.s.a,b:x.s.b})).sort((p,q)=>p.a-q.a).reduce((m,r)=>{const l=m[m.length-1];if(l&&r.a<=l.b)l.b=Math.max(l.b,r.b);else m.push({a:r.a,b:r.b});return m;},[]);}
 function exportRow(sg){const s=cur(sg);const act=sg.c.edit.action;return{video_id:D.video_id,interval_id:sg.iv.id,interval_kind:sg.iv.kind,interval_start_s:sg.iv.start_s,interval_end_s:sg.iv.end_s,predicted_R_start:+sg.iv.retention_start.toFixed(4),predicted_R_end:+sg.iv.retention_end.toFixed(4),source:sg.c.source,rule:sg.c.rule,suggestion:sg.c.suggestion,rationale:sg.c.rationale||'',confidence:sg.c.confidence==null?'':sg.c.confidence,evidence_refs:(sg.c.evidence_refs||[]).join(' '),action:act,edit_start_s:act==='add'?sg.c.edit.start_s:+(+s.a).toFixed(2),edit_end_s:act==='add'?'':+(+s.b).toFixed(2),decision:s.decision,note:s.note,data_kind:'predicted_retention_unvalidated'};}
 function buildExport(){const items=SUGS.map(exportRow);const tr=acceptedTrims();const removed=tr.reduce((a,r)=>a+(r.b-r.a),0);
 return{video_id:D.video_id,sha256:D.sha256,exported_at:new Date().toISOString(),disclaimer:DISCLAIMER,gemini_used:!!(D.gemini_info&&D.gemini_info.used),gemini_model:D.gemini_info&&D.gemini_info.used?D.gemini_info.model:null,retention_is_prediction:true,model:D.model,
@@ -263,16 +396,19 @@ $('meta').textContent=[D.duration_s?D.duration_s.toFixed(1)+' s':null,'predicted
 $('banner').append(el('b',{text:'⚠'}),el('span',{text:DISCLAIMER+' '+D.confidence_note+'.'+(D.partial?' PARTIAL: only the first '+D.horizon_s+' s were predicted.':'')+(D.deviations.length?' Differs from upstream evaluation: '+D.deviations.join('; ')+'.':'')}));
 $('sidefoot').textContent='Model: '+(D.model||'TTCC')+'. Curves are predictions, not audience data. Nothing on this page is uploaded.';
 $('topexport').addEventListener('click',()=>{$('exports').scrollIntoView({behavior:'smooth'});});
-if(SRC){V.src=SRC;V.addEventListener('error',()=>{$('vnote').textContent='The browser could not load the video ('+(SERVED?'served over http':D.video_path)+'). If you opened this file directly, try: python3 scripts/serve_review.py '+D.video_id+' --artifacts <root> --video <file> --open. Timestamps still apply.';});}
-else{V.style.display='none';$('vnote').textContent='Video file not found at '+D.video_path+'. Timestamps still apply, but playback and previews are unavailable.';}
+if(SRC){V.src=SRC;V.addEventListener('error',()=>{$('vnote').textContent='The browser could not load the video ('+(SERVED?'the file may be missing or use a codec this browser cannot play':'opened as a local file')+'). Use the Hookline app, or: python3 scripts/serve_review.py '+D.video_id+' --artifacts <root> --video <file> --open. Timestamps still apply.';});}
+else{V.style.display='none';if(!SERVED&&D.video_url){$('vnote').textContent='This page was opened as a local file, which browsers block from playing video. Open it through Hookline: python3 scripts/serve_review.py '+D.video_id+' --artifacts <root> --video <file> --open';}else $('vnote').textContent='The video file was not found. Timestamps still apply, but playback and previews are unavailable.';}
 const GI=D.gemini_info||{used:false};const gb0=$('geminibox');
 if(GI.used){gb0.append(el('h2',{text:'Gemini overview (model interpretation)'}));if(GI.overall){gb0.append(el('p',{text:GI.overall.hook_assessment}));if(GI.overall.top_priorities.length)gb0.append(el('p',{class:'mut',text:'Gemini\'s priority order: '+GI.overall.top_priorities.join(' → ')}));}
+if(GI.audio){const A=GI.audio;gb0.append(el('h3',{text:'Audio (AI hypothesis, from listening)'}),el('p',{text:A.kind.replace(/_/g,' ')+(A.energy?' · '+A.energy+' energy':'')+'. '+A.description}),el('p',{class:'mut',text:A.familiarity+' Trend status is not known to this tool.'}));if(A.fit){gb0.append(el('div',{class:'fcard',style:'--c:'+(A.fit.verdict==='fits'?'#5fd38a':A.fit.verdict==='clashes'?'#ff5468':'#ffcf47')},el('b',{text:'Does the audio suit the video? '+A.fit.verdict+' (AI hypothesis)'}),el('div',{class:'why',text:A.fit.reason})));}
+if(A.changes&&A.changes.length)gb0.append(el('p',{class:'mut',text:'Audio moments: '+A.changes.map(c=>mmss(c.at_s)+' '+c.what).join(' · ')}));}
 gb0.append(el('p',{class:'mut',text:'Gemini ('+(GI.model||'model')+') explains the content and proposes edits; TTCC predicts retention. All of it is hypotheses until validated against real audience-retention data.'+(GI.validation&&GI.validation.dropped?' '+GI.validation.dropped+' item(s) of its answer failed validation and were dropped.':'')}));}
 else{gb0.append(el('h2',{text:'Gemini'}),el('p',{class:'mut',text:'Gemini interpretation: not used'+(GI.reason?' ('+GI.reason+')':'')+'. Proposals are rule-based only.'}));}
 // ---- control: jump / previews
 let mode=null;function startPlay(){if(SRC)V.play().catch(()=>{});}
-function jump(t,end){mode=end==null?null:{kind:'segment',until:end};V.currentTime=t;startPlay();V.scrollIntoView({behavior:'smooth',block:'nearest'});}
-function previewTrim(a,b){mode={kind:'trim',a:a,b:b,until:Math.min(TOTAL,b+2)};V.currentTime=Math.max(0,a-2);startPlay();V.scrollIntoView({behavior:'smooth',block:'nearest'});}
+function ensurePlayer(){if(!['analysis','edit'].includes(document.body.getAttribute('data-view')))setView('edit',true);}
+function jump(t,end){ensurePlayer();mode=end==null?null:{kind:'segment',until:end};V.currentTime=t;startPlay();V.scrollIntoView({behavior:'smooth',block:'nearest'});}
+function previewTrim(a,b){ensurePlayer();mode={kind:'trim',a:a,b:b,until:Math.min(TOTAL,b+2)};V.currentTime=Math.max(0,a-2);startPlay();V.scrollIntoView({behavior:'smooth',block:'nearest'});}
 function playEdited(){const tr=acceptedTrims();mode={kind:'edited',ranges:tr};V.currentTime=0;startPlay();}
 function tick(){if(!SRC||!mode)return;const t=V.currentTime;
 if(mode.kind==='segment'&&t>=mode.until){V.pause();mode=null;}
@@ -286,6 +422,71 @@ const job=FQ.shift();fbusy=true;let fin=false;const done=()=>{if(fin)return;fin=
 const draw=()=>{try{const c=job.canvas,ctx=c.getContext('2d');const vw=FV.videoWidth||16,vh=FV.videoHeight||10;c.width=320;c.height=200;const sc=Math.max(320/vw,200/vh);ctx.drawImage(FV,(320-vw*sc)/2,(200-vh*sc)/2,vw*sc,vh*sc);PAINTED++;}catch(e){}done();};
 FV.addEventListener('seeked',draw);const go=()=>{try{FV.currentTime=Math.min(Math.max(0,job.t),Math.max(0,(FV.duration||TOTAL)-0.05));}catch(e){done();}};
 if(FV.readyState>=1)go();else FV.addEventListener('loadedmetadata',go,{once:true});}
+// ---- scores (0-100 positions in the reference set, each with the measured accuracy of its model)
+(function(){const S=D.scores;if(!S||S.status!=='ok')return;$('scorespanel').style.display='';const NS='http://www.w3.org/2000/svg';
+const ring=(v,color)=>{const svg=document.createElementNS(NS,'svg');svg.setAttribute('viewBox','0 0 100 100');const mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const[k,x]of Object.entries(a))e.setAttribute(k,x);return e;};
+svg.append(mk('circle',{cx:50,cy:50,r:40,fill:'none',stroke:'#232838','stroke-width':9}));
+if(v!=null){const c=2*Math.PI*40;svg.append(mk('circle',{cx:50,cy:50,r:40,fill:'none',stroke:color,'stroke-width':9,'stroke-linecap':'round','stroke-dasharray':(c*v/100)+' '+c,transform:'rotate(-90 50 50)'}));}
+const t=mk('text',{x:50,y:58,'text-anchor':'middle','font-size':26,'font-weight':700,fill:'#e8eaf1','font-family':'ui-monospace,Menlo,monospace'});t.textContent=v==null?'–':String(v);svg.append(t);return svg;};
+const g=$('gauges');const add=(label,v,color,line,acc,cls)=>{const box=el('div',{class:'gauge '+(cls||'')});box.append(ring(v,color),el('div',{class:'gl',text:label}),el('div',{class:'gv',text:line}));if(acc)box.append(acc);g.append(box);};
+const B=S.breakout_score||{},HS=S.hook_score||{},RP=S.retention_pct;
+const PP=S.popularity_score||{};const pacc=PP.accuracy||{};const pnote=el('div',{class:'ga'});
+pnote.append(el('b',{text:pacc.evaluated?'AUC '+pacc.auc.toFixed(2)+(pacc.auc_ci95?' ['+pacc.auc_ci95[0].toFixed(2)+', '+pacc.auc_ci95[1].toFixed(2)+']':'')+' · ':'not evaluated · '}),document.createTextNode(PP.score==null?(PP.reason||''):(pacc.evaluated&&pacc.auc_ci95&&pacc.auc_ci95[0]<=0.5?(pacc.auc<0.5?'no signal found':'not shown to beat chance'):'')));
+add('POPULARITY (TRIBE, experimental)',PP.score==null?null:PP.score,'#b47cf0',PP.score==null?'not available':'',pnote,pacc.evaluated&&pacc.auc_ci95&&pacc.auc_ci95[0]>0.5?'ok':'weak');
+add('HOOK',HS.score==null?null:HS.score,'#5fd38a',HS.score==null?'needs TTCC on the reference set':'early hold '+Math.round(100*HS.early_hold)+'%',HS.score==null?el('div',{class:'ga',text:HS.reason||''}):null);
+add('RETENTION (predicted)',RP?RP['5s']:null,'#ffcf47',RP?['1s','3s','5s','10s'].filter(k=>RP[k]!=null).map(k=>k+' '+RP[k]+'%').join(' · '):'no TTCC prediction',null);
+})();
+// ---- hook strength: why it is strong or weak (from hook_report.json)
+(function(){const R=D.hook_report;if(!R||R.status!=='ok')return;const box=$('hookwhy');box.style.display='';const V=R.verdict||{};
+const label=(V.label||'not rated');const vrow=el('div',{class:'verdict'},el('span',{class:'vb '+label.replace(' ',''),text:'PREDICTED HOLD: '+({strong:'ABOVE TYPICAL',weak:'BELOW TYPICAL',average:'TYPICAL'}[label]||label.toUpperCase())}),el('span',{class:'mut',text:(V.basis||'')+' On the 100 reference reels this did not track views (reels in the bottom quarter beat their page\'s median 40% of the time, the top quarter 44%), so read it as a description of the predicted curve, not a grade.'}));box.append(vrow);
+const byKey={};(R.factors||[]).forEach(f=>byKey[f.key]=f);
+const card=(f,good)=>{const c=el('div',{class:'fcard'});c.style.setProperty('--c',good?'#5fd38a':'#ff5468');
+const pctTxt=f.percentile_vs_reference==null?'':' · '+Math.round(f.percentile_vs_reference)+'th percentile of '+((R.reference&&R.reference.n_reels)||100)+' reference reels';
+c.append(el('b',{text:f.label+': '+(f.value==null?'n/a':(typeof f.value==='number'?(+f.value.toFixed(2)):f.value)+(f.unit?' '+f.unit:''))+pctTxt}),el('div',{text:f.reading||''}),el('div',{class:'why',text:f.why_it_matters||''}));return c;};
+const cols=el('div',{class:'cols2'});const a=el('div',{},el('div',{class:'mut',text:'Working for the hook'}));const b=el('div',{},el('div',{class:'mut',text:'Working against it'}));
+(R.strengths||[]).forEach(k=>byKey[k]&&a.append(card(byKey[k],true)));(R.weaknesses||[]).forEach(k=>byKey[k]&&b.append(card(byKey[k],false)));
+if(a.children.length===1)a.append(el('div',{class:'mut',text:'Nothing stood out as helping, against the reference reels.'}));if(b.children.length===1)b.append(el('div',{class:'mut',text:'Nothing stood out as hurting, against the reference reels.'}));cols.append(a,b);box.append(cols);
+if(R.gemini_hook_assessment){box.append(el('div',{class:'fcard',style:'--c:#b47cf0'},el('b',{text:'Gemini on the opening (model interpretation)'}),el('div',{text:R.gemini_hook_assessment})));}
+const det=el('details',{style:'margin-top:8px'},el('summary',{text:'All hook factors'}));const t=el('table');t.append(el('thead',{},el('tr',{},...['Factor','Value','Percentile','Reading'].map(h=>el('th',{text:h})))));const tb=el('tbody');
+(R.factors||[]).forEach(f=>tb.append(el('tr',{},el('td',{text:f.label}),el('td',{class:'mono',text:f.value==null?'n/a':(typeof f.value==='number'?+f.value.toFixed(3):f.value)+(f.unit?' '+f.unit:'')}),el('td',{class:'mono',text:f.percentile_vs_reference==null?'–':Math.round(f.percentile_vs_reference)}),el('td',{text:(f.direction||'')+' · '+(f.reading||'')}))));t.append(tb);det.append(t);box.append(det);
+box.append(el('p',{class:'mut',style:'margin:8px 0 0',text:R.note||''}));})();
+// ---- strongest and weakest moments (from moments.json)
+(function(){const M=D.moments;if(!M||!((M.strongest||[]).length||(M.weakest||[]).length))return;$('momentspanel').style.display='';
+$('momentssub').textContent='Ranked by the predicted hazard (share of remaining viewers lost per second) in '+M.window_s+' s windows after the opening'+(M.curve_is_stitched?' (stitched curve: approximate)':'')+'. A relative measure within this video; model prediction, not audience data.';
+const mk=(title,cls,list,color)=>{const col=el('div',{class:'mcol '+cls},el('h3',{text:title}));
+if(!list.length)col.append(el('div',{class:'mut',text:M.note||'none found'}));
+for(const m of list){const c=el('div',{class:'mcard'});c.style.setProperty('--c',color);
+c.append(el('div',{},el('span',{class:'tm',text:mmss(m.start_s)+' – '+mmss(m.end_s)}),el('span',{class:'mut',text:'   R '+pc(m.retention_start)+' → '+pc(m.retention_end)+(m.relative_to_video_median_hazard!=null?' · '+(+m.relative_to_video_median_hazard).toFixed(1)+'× the video\'s median hazard':'')})));
+const ul=el('ul');(m.why||[]).forEach(w=>ul.append(el('li',{text:w})));if(ul.children.length)c.append(ul);
+if(m.suggested_action&&m.suggested_action.text)c.append(el('div',{class:'act',text:(m.suggested_action.action||'review').toUpperCase()+': '+m.suggested_action.text}));
+c.addEventListener('click',()=>jump(m.start_s,m.end_s));col.append(c);}return col;};
+$('moments').append(mk('Strongest moments','good',M.strongest||[],'#5fd38a'),mk('Weakest moments','bad',M.weakest||[],'#ff5468'));})();
+// ---- what if: apply the accepted trims, predict the edited video (needs the upload page server)
+const APPMODE=SERVED&&/^\/review\/UP[0-9a-z]+\/?$/.test(location.pathname),WID=APPMODE?location.pathname.replace(/^\/review\/|\/$/g,''):null;
+function whatifState(){const n=acceptedTrims().length;const go=$('whatifgo');if(!APPMODE){go.disabled=true;$('whatifmsg').textContent='Available when you open an analysis from the upload page (python3 scripts/serve_app.py).';return;}
+go.disabled=n===0;$('playedited').disabled=n===0;$('whatifmsg').textContent=n?(n+' accepted trim(s) will be applied'):'Accept at least one trim first, or use "Accept all suggested trims".';}
+function renderWhatif(r){const out=$('whatifout');out.style.display='';out.textContent='';
+const wrap=el('div',{style:'margin-top:10px'});const NS='http://www.w3.org/2000/svg',W=760,H=230,L=44,Rr=10,T=10,B=26,pw=W-L-Rr,ph=H-T-B;const svg=document.createElementNS(NS,'svg');svg.setAttribute('viewBox','0 0 '+W+' '+H);
+const mkS=(t,a)=>{const e=document.createElementNS(NS,t);for(const[k,v]of Object.entries(a))e.setAttribute(k,v);return e;};
+const n=Math.max((r.original_retention||[]).length,(r.edited_retention||[]).length)-1;const x=(t)=>L+pw*t/Math.max(1,n),y=(v)=>T+ph*(1-v);
+for(let i=0;i<=4;i++){const v=i/4;svg.append(mkS('line',{x1:L,x2:L+pw,y1:y(v),y2:y(v),stroke:'#232838'}));const tx=mkS('text',{x:L-8,y:y(v)+4,'text-anchor':'end','font-size':11,fill:'#8c92a6'});tx.textContent=Math.round(v*100)+'%';svg.append(tx);}
+const step=n<=20?2:n<=60?10:20;for(let t=0;t<=n;t+=step){const tx=mkS('text',{x:x(t),y:H-8,'text-anchor':'middle','font-size':11,fill:'#8c92a6'});tx.textContent=t+'s';svg.append(tx);}
+const line=(arr,color,dash)=>svg.append(mkS('polyline',{points:arr.map((v,t)=>x(t)+','+y(v)).join(' '),fill:'none',stroke:color,'stroke-width':2.2,'stroke-dasharray':dash||''}));
+line(r.original_retention||[],'#5fd38a');line(r.edited_retention||[],'#b47cf0','5 3');wrap.append(svg);
+wrap.append(el('div',{class:'mut',text:'Green: original (predicted). Purple dashed: edited (predicted), on the edited video\'s own timeline. Removed: '+(+r.removed_s).toFixed(1)+' s ('+(+r.original_duration_s).toFixed(1)+' s → '+(+r.edited_duration_s).toFixed(1)+' s).'}));
+const t=el('table',{class:'wtable',style:'margin-top:8px'});t.append(el('thead',{},el('tr',{},...['Metric','Original','Edited','Change','vs noise'].map(h=>el('th',{text:h})))));const tb=el('tbody');
+for(const m of (r.metrics||[])){const d=m.delta;tb.append(el('tr',{},el('td',{text:m.label}),el('td',{class:'mono',text:m.original==null?'–':(+m.original).toFixed(3)}),el('td',{class:'mono',text:m.edited==null?'–':(+m.edited).toFixed(3)}),
+el('td',{class:'mono '+(m.within_noise?'noise':d>0?'pos':'neg'),text:d==null?'–':(d>0?'+':'')+(+d).toFixed(3)}),el('td',{class:'mut',text:m.within_noise?'within noise (3x re-encoding noise)':'beyond noise'})));}t.append(tb);wrap.append(t);
+wrap.append(el('div',{class:'fcard',style:'--c:#ffcf47;margin-top:10px'},el('b',{text:'Predicted effect: '+(r.verdict||'no clear difference')}),...(r.caveats||[]).map(c=>el('div',{class:'why',text:c}))));
+for(const w of (r.warnings||[]))wrap.append(el('div',{class:'mut',text:'Note: '+w}));out.append(wrap);}
+async function whatifPoll(){try{const res=await fetch('/api/whatif/'+WID);const j=await res.json();
+if(j.status==='running'){$('whatifmsg').textContent='predicting the edited video… '+j.seconds+' s';setTimeout(whatifPoll,2500);return;}
+$('whatifgo').disabled=false;if(j.status==='failed'){$('whatifmsg').textContent='failed: '+j.error;return;}$('whatifmsg').textContent='done in '+j.seconds+' s';renderWhatif(j.result);}catch(e){$('whatifmsg').textContent='lost contact with the local server';}}
+$('acceptall').addEventListener('click',()=>{let k=0;for(const sg of SUGS){if(sg.c.edit.action!=='trim')continue;const a=sg.c.edit.start_s,b=sg.c.edit.end_s;if(!(b>a))continue;store[sg.id]=Object.assign(store[sg.id]||{},{decision:'accepted'});k++;}persist();if(!k){$('whatifmsg').textContent='There are no suggested trims on this video.';return;}try{location.reload();}catch(e){refreshEdited();}});
+$('whatifgo').addEventListener('click',async()=>{$('whatifgo').disabled=true;$('whatifmsg').textContent='starting…';
+try{const res=await fetch('/api/whatif/'+WID,{method:'POST',headers:{'X-Hookline':'1','Content-Type':'application/json'},body:JSON.stringify({trims:acceptedTrims().map(r=>({start_s:r.a,end_s:r.b}))})});
+const j=await res.json();if(!res.ok){$('whatifmsg').textContent=j.error||'could not start';$('whatifgo').disabled=false;return;}whatifPoll();}catch(e){$('whatifmsg').textContent='could not start: '+e;$('whatifgo').disabled=false;}});
+if(APPMODE){fetch('/api/whatif/'+WID).then(r=>r.ok?r.json():null).then(j=>{if(j&&j.status==='done'&&j.result)renderWhatif(j.result);}).catch(()=>{});}
 // ---- hook tiles
 const tiles=$('tiles');const H=D.hook||{};const secKind=(t)=>{const s=D.seconds.find(x=>x.t===t);return s?s.kind:null;};
 const KC={steep:'#ff5468',decline:'#ffcf47',hold:'#5fd38a',gradual:'#b47cf0'};
@@ -300,17 +501,26 @@ if(D.horizon_s<TOTAL-0.5){const n=el('div',{class:'none',title:'no prediction he
 const trimEls=[];const head=el('div',{class:'head'});strip.append(head);
 strip.addEventListener('click',(ev)=>{const r=strip.getBoundingClientRect();jump(TOTAL*(ev.clientX-r.left)/r.width);});
 let chartHead=null,chartX=null;
-(function(){const svg=$('chart'),NS='http://www.w3.org/2000/svg',W=760,Hh=250,L=44,R=10,T=12,B=28,pw=W-L-R,ph=Hh-T-B,n=D.retention.length-1;
-const x=(t)=>L+pw*t/n,y=(r)=>T+ph*(1-r);chartX=x;const mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const[k,v]of Object.entries(a))e.setAttribute(k,v);return e;};
+function drawChart(logScale){const svg=$('chart');svg.textContent='';const NS='http://www.w3.org/2000/svg',W=760,Hh=250,L=44,R=10,T=12,B=28,pw=W-L-R,ph=Hh-T-B,n=D.retention.length-1;
+const LOGMIN=-3,pos=(r)=>logScale?(Math.log10(Math.max(r,1e-3))-LOGMIN)/(-LOGMIN):r;const x=(t)=>L+pw*t/n,y=(r)=>T+ph*(1-pos(r));chartX=x;const mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const[k,v]of Object.entries(a))e.setAttribute(k,v);return e;};
 const defs=mk('defs',{});const gr=mk('linearGradient',{id:'gfill',x1:0,y1:0,x2:0,y2:1});gr.append(mk('stop',{offset:'0%','stop-color':'#5fd38a','stop-opacity':0.35}),mk('stop',{offset:'100%','stop-color':'#5fd38a','stop-opacity':0}));defs.append(gr);svg.append(defs);
-for(let i=0;i<=4;i++){const r=i/4;svg.append(mk('line',{x1:L,x2:L+pw,y1:y(r),y2:y(r),stroke:'#232838','stroke-width':1}));const tx=mk('text',{x:L-8,y:y(r)+4,'text-anchor':'end','font-size':11,fill:'#8c92a6','font-family':'ui-monospace,Menlo,monospace'});tx.textContent=Math.round(r*100)+'%';svg.append(tx);}
+const GRID=logScale?[1,0.1,0.01,0.001]:[0,0.25,0.5,0.75,1];for(const r of GRID){svg.append(mk('line',{x1:L,x2:L+pw,y1:y(r),y2:y(r),stroke:'#232838','stroke-width':1}));const tx=mk('text',{x:L-8,y:y(r)+4,'text-anchor':'end','font-size':11,fill:'#8c92a6','font-family':'ui-monospace,Menlo,monospace'});tx.textContent=(logScale?(+(r*100).toPrecision(2)):Math.round(r*100))+'%';svg.append(tx);}
 const step=n<=10?1:n<=40?5:10;for(let t=0;t<=n;t+=step){svg.append(mk('line',{x1:x(t),x2:x(t),y1:T,y2:T+ph,stroke:'#1a1e2b','stroke-width':1}));const tx=mk('text',{x:x(t),y:Hh-8,'text-anchor':'middle','font-size':11,fill:'#8c92a6','font-family':'ui-monospace,Menlo,monospace'});tx.textContent=t+'s';svg.append(tx);}
 for(const iv of D.intervals){svg.append(mk('rect',{x:x(iv.start_s),y:T,width:Math.max(2,x(iv.end_s)-x(iv.start_s)),height:ph,fill:COLOR[iv.kind]||'#5b6276','fill-opacity':'0.07'}));}
-const pts=D.retention.map((r,t)=>x(t)+','+y(r));svg.append(mk('polygon',{points:x(0)+','+y(0)+' '+pts.join(' ')+' '+x(n)+','+y(0),fill:'url(#gfill)'}));
+if(D.ref_band){const B=D.ref_band,m=Math.min(n,B.p50.length-1);const up=[],dn=[],md=[];for(let t=0;t<=m;t++){up.push(x(t)+','+y(B.p90[t]));dn.unshift(x(t)+','+y(B.p10[t]));md.push(x(t)+','+y(B.p50[t]));}
+const bp=mk('polygon',{points:up.concat(dn).join(' '),fill:'#8c92a6','fill-opacity':0.18});const bt=mk('title',{});bt.textContent='Where 80% of '+B.n_reels+' reference reels\' predicted curves fall';bp.append(bt);svg.append(bp);
+svg.append(mk('polyline',{points:md.join(' '),fill:'none',stroke:'#8c92a6','stroke-width':1.4,'stroke-dasharray':'5 4'}));
+if(B.blank){const bl=[];for(let t=0;t<=Math.min(n,B.blank.length-1);t++)bl.push(x(t)+','+y(B.blank[t]));svg.append(mk('polyline',{points:bl.join(' '),fill:'none',stroke:'#ff5468','stroke-width':1.2,'stroke-dasharray':'1.5 3.5','stroke-linecap':'round'}));}}
+const pts=D.retention.map((r,t)=>x(t)+','+y(r));svg.append(mk('polygon',{points:x(0)+','+(T+ph)+' '+pts.join(' ')+' '+x(n)+','+(T+ph),fill:'url(#gfill)'}));
 svg.append(mk('polyline',{points:pts.join(' '),fill:'none',stroke:'#5fd38a','stroke-width':2.2,'stroke-linejoin':'round'}));
 D.retention.forEach((r,t)=>{const c=mk('circle',{cx:x(t),cy:y(r),r:6,fill:'transparent',style:'cursor:pointer'});const ti=mk('title',{});ti.textContent='t='+t+' s, predicted R='+r.toFixed(3)+' — click to jump';c.append(ti);c.addEventListener('click',()=>jump(t));svg.append(c);});
 for(const iv of D.intervals){if(iv.kind==='holds')continue;const t=iv.start_s;const c=mk('circle',{cx:x(t),cy:y(D.retention[Math.min(t,n)]),r:5.5,fill:COLOR[iv.kind],stroke:'#0a0c12','stroke-width':2,style:'cursor:pointer'});const ti=mk('title',{});ti.textContent=iv.kind.replace('_',' ')+' '+iv.start_s+'–'+iv.end_s+' s';c.append(ti);c.addEventListener('click',()=>{select(iv.id);jump(iv.start_s);});svg.append(c);}
-chartHead=mk('line',{x1:L,x2:L,y1:T,y2:T+ph,stroke:'#ffffff','stroke-width':1.5,'stroke-dasharray':'3 3'});svg.append(chartHead);})();
+chartHead=mk('line',{x1:L,x2:L,y1:T,y2:T+ph,stroke:'#ffffff','stroke-width':1.5,'stroke-dasharray':'3 3'});svg.append(chartHead);}
+drawChart(false);(function(){const B=D.ref_band;if(!B)return;const m=Math.min(10,D.retention.length-1,B.p50.length-1);if(m<3)return;let inn=0,above=0,below=0;for(let t=1;t<=m;t++){const r=D.retention[t];if(r>B.p90[t])above++;else if(r<B.p10[t])below++;else inn++;}
+const el2=$('bandverdict');const f=(inn/m);
+el2.textContent=f>=0.8?'This curve stays inside the typical band over the first '+m+' s. For videos like this the TTCC authors\' own tests found the model no better than predicting the average curve (it was worse on videos close to the average), so treat the curve as "typical", not as a forecast.':(above>=below?'This curve runs above the typical band for part of the first '+m+' s: TTCC sees something it expects to hold better than most reels. Still a prediction, not audience data.':'This curve runs below the typical band for part of the first '+m+' s: TTCC expects it to lose viewers faster than most reels. Still a prediction, not audience data.');})();
+if(!D.ref_band){const bn=$('bandnote');if(bn)bn.style.display='none';}
+(function(){const b=$('logtoggle');let lg=false;b.addEventListener('click',()=>{lg=!lg;drawChart(lg);b.textContent=lg?'Show normal scale':'Zoom into the tail (log scale)';$('logscalenote').style.display=lg?'':'none';});})();
 const film=$('film');const NF=Math.max(4,Math.min(8,Math.round(TOTAL/5)));const filmEls=[];
 for(let i=0;i<NF;i++){const t=TOTAL*(i+0.5)/NF;const c=el('canvas',{width:320,height:200});const f=el('div',{class:'fr',title:'jump to '+fmt(t)},c,el('span',{text:mmss(t)}));f.addEventListener('click',()=>jump(t));film.append(f);filmEls.push({f,t});frameAt(c,t);}
 // ---- segment list and the detail panel
@@ -389,7 +599,7 @@ let act=null;D.segments.forEach((sg,i)=>{const on=t>=sg.start_s&&t<sg.end_s;segE
 D.intervals.forEach((iv,i)=>{cards[i].classList.toggle('active',t>=iv.start_s&&t<iv.end_s);});
 filmEls.forEach((x,i)=>{const a=TOTAL*i/NF,b=TOTAL*(i+1)/NF;x.f.classList.toggle('on',t>=a&&t<b);});
 $('activeinfo').textContent=act?('inside: '+act.kind.replace('_',' ')+' '+act.start_s+'–'+act.end_s+' s (predicted R '+act.retention_start.toFixed(2)+' → '+act.retention_end.toFixed(2)+', rank '+act.rank_by_predicted_loss+' by predicted fall)'):'';}
-function refreshEdited(){const tr=acceptedTrims();trimEls.forEach(e=>e.remove());trimEls.length=0;for(const r of tr){const e=el('div',{class:'trim',title:'accepted trim '+r.a.toFixed(1)+'–'+r.b.toFixed(1)+' s'});e.style.left=pct(r.a);e.style.width=(100*(r.b-r.a)/TOTAL)+'%';strip.insertBefore(e,head);trimEls.push(e);}
+function refreshEdited(){whatifState();const tr=acceptedTrims();trimEls.forEach(e=>e.remove());trimEls.length=0;for(const r of tr){const e=el('div',{class:'trim',title:'accepted trim '+r.a.toFixed(1)+'–'+r.b.toFixed(1)+' s'});e.style.left=pct(r.a);e.style.width=(100*(r.b-r.a)/TOTAL)+'%';strip.insertBefore(e,head);trimEls.push(e);}
 const rem=tr.reduce((a,r)=>a+(r.b-r.a),0);$('editedinfo').textContent=tr.length?(tr.length+' accepted trim(s) remove '+rem.toFixed(1)+' s: '+TOTAL.toFixed(1)+' s → '+(TOTAL-rem).toFixed(1)+' s'):'no accepted trims yet';}
 setInterval(()=>{tick();sync();},100);V.addEventListener('seeked',sync);
 // ---- scores table
@@ -435,6 +645,10 @@ ok(document.querySelectorAll('#segscores tbody tr').length===D.segments.length,'
 ok(toCSVRows(segmentRows()).split('\r\n').length===D.segments.length+2,'segment-score CSV has header + rows');
 ok(Math.abs(D.segments.reduce((a,sg)=>a+(sg.share_of_total_predicted_loss||0),0)-1)<0.01,'shares of the predicted fall add up to 1');
 ok(document.querySelectorAll('#tiles .tile').length===4,'four hook tiles');
+ok(!(D.hook_report&&D.hook_report.status==='ok')||document.querySelectorAll('#hookwhy .vb').length===1,'hook verdict shown when the hook report exists');
+ok(!(D.moments&&((D.moments.strongest||[]).length||(D.moments.weakest||[]).length))||document.querySelectorAll('#moments .mcard').length===(D.moments.strongest||[]).length+(D.moments.weakest||[]).length,'one card per moment');
+ok($('whatifgo')!==null&&$('whatifgo').disabled===true,'what-if is disabled until a trim is accepted (and outside the upload page)');
+ok(!(D.scores&&D.scores.status==='ok')||document.querySelectorAll('.gauge').length===3,'three score gauges when scores exist');
 if(D.intervals.length>1){const last=D.intervals[D.intervals.length-1];select(last.id);ok(document.querySelector('.card.sel').dataset.id===last.id,'selecting a segment shows its detail');select(D.intervals[0].id);}
 const first=SUGS.find(sg=>sg.c.edit.action==='trim');
 if(first){store[first.id]={decision:'accepted',a:1,b:2.5,note:'x'};refreshEdited();const ex=buildExport();ok(ex.accepted_trims.length===1&&ex.accepted_trims[0].start_s===1&&ex.accepted_trims[0].end_s===2.5,'accepted trim reaches the export');
@@ -444,5 +658,31 @@ else ok(true,'no trim proposals on this video (skipped trim checks)');
 ok(SUGS.every(sg=>['trim','add','review'].includes(sg.c.edit.action)),'every proposal has a known action');
 ok($('banner').textContent.includes('PREDICTED')&&$('banner').textContent.includes('not been verified'),'banner states prediction and unverified accuracy');
 const pre=el('pre',{id:'selftest'});pre.textContent=(out.every(l=>l.startsWith('PASS'))?'SELFTEST PASS':'SELFTEST FAIL')+'\n'+out.join('\n');document.body.append(pre);}
+
+/* four views: Analysis, Insights, Edit Review, Diagnostics (same DOM, shown per view) */
+const VIEWS=['analysis','insights','edit','diagnostics'];
+function setView(v,quiet){if(!VIEWS.includes(v))v='analysis';document.body.setAttribute('data-view',v);document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.dataset.v===v));if(!quiet){try{history.replaceState(null,'','#'+v);}catch(e){}}window.scrollTo(0,0);}
+document.querySelectorAll('#nav a').forEach(a=>a.addEventListener('click',e=>{e.preventDefault();setView(a.dataset.v);}));
+const RANK={steep_drop:0,sustained_decline:1,holds:2,unflagged:3};
+const TOP=SUGS.slice().sort((x,y)=>(RANK[x.iv.kind]??4)-(RANK[y.iv.kind]??4)||((y.c.confidence||0)-(x.c.confidence||0))).slice(0,3);
+const tl=$('topsugslist');if(!TOP.length){tl.append(el('p',{class:'mut',text:'No edit suggestions: nothing was flagged on this video.'}));}
+TOP.forEach(sg=>{const c=sg.c,e=c.edit;const row=el('div',{class:'tsug'});
+const b1=el('button',{class:'small',text:'Inspect evidence'});b1.addEventListener('click',()=>{setView('edit');select(sg.iv.id);jump(sg.iv.start_s,sg.iv.end_s);});
+const b2=el('button',{class:'small primary',text:e.action==='trim'?'Review trim':'Review'});b2.addEventListener('click',()=>{setView('edit');select(sg.iv.id);});
+row.append(el('b',{text:mmss(sg.iv.start_s)+'–'+mmss(sg.iv.end_s)+'  '+c.suggestion}),el('div',{class:'acts'},b1,b2),
+el('div',{class:'why'},el('span',{class:'tag'+(c.source==='gemini'?' ai':''),text:c.source==='gemini'?'AI SUGGESTION':'RULE-BASED'}),c.rationale||''));tl.append(row);});
+(function diag(){const b=$('diagbody');const add=(h,node)=>{b.append(el('h3',{text:h}),node);};
+const kv=(o)=>el('pre',{text:JSON.stringify(o,null,2)});
+add('TTCC prediction',kv({model:D.model,status:(D.ttcc_status||{}).status||null,reason:(D.ttcc_status||{}).reason||null,analysed_span_s:D.horizon_s,video_duration_s:D.duration_s,partial:!!D.partial,
+native_hook_pass_s:(D.hook||{}).window_end_s||null,full_curve:D.stitched?'merged 10 s windows every 5 s in hazard space: APPROXIMATE, not one native pass':'single native pass',deviations_from_upstream:D.deviations}));
+add('Processing audit (what was and was not done to the curve)',kv(D.curve_audit||'not available'));
+add('Inference configuration',kv(D.inference||'not recorded'));
+b.append(el('p',{class:'mut',text:'Attention kernel: a run may use sdpa or flash_attn. They compute the same attention with different floating-point rounding, so predictions can differ slightly between kernels. How much, for these videos, has not been measured; the configuration above records what ran where it is available.'}));
+const GI=D.gemini_info||{};add('Gemini',kv({used:!!GI.used,model:GI.model||null,status:GI.status||null,reason:GI.reason||null,validation:GI.validation||null}));
+add('Music vs voice (Demucs, first 5 s)',kv(D.stems?Object.fromEntries(Object.entries(D.stems).filter(([k])=>k!=='per_second')):'not run'));
+add('Scores: how to read them',el('p',{class:'mut',text:'Breakout and hook are percentiles among the 100 reference reels with real views (50 = typical). '+((D.scores&&D.scores.note)||'')}));
+add('Evidence availability',kv((D.hook_report||{}).evidence_availability||'not recorded'));
+add('Hook and score files',kv({hook_scores:D.scores?'present':'absent',hook_report:D.hook_report?'present':'absent',moments:D.moments?'present':'absent'}));})();
+setView((location.hash||'').slice(1),true);
 </script></body></html>
 """

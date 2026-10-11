@@ -113,7 +113,7 @@ def test_segments_cover_the_whole_span_and_are_scored_without_merging_the_two_ki
     assert sum(s["share_of_total_predicted_loss"] for s in segs) == pytest.approx(1.0)
     first = segs[0]
     assert first["kind"] == "steep_drop" and first["rank_by_predicted_loss"] == 1 and first["interval_id"] == "d0"
-    assert first["heuristic"]["attention_risk"] == {"mean": 30.0, "max": 40.0} and first["heuristic"]["available"] is True
+    assert first["heuristic"]["attention_risk"] == {"mean": 20.0, "max": 40.0} and first["heuristic"]["available"] is True
     assert "combined" not in json.dumps(segs) and "score" not in first  # no single merged score is invented
     assert sorted(s["rank_by_predicted_loss"] for s in segs) == list(range(1, len(segs) + 1))
     assert any(s["kind"] == "unflagged" for s in segs) or all(s["interval_id"] for s in segs)
@@ -124,3 +124,38 @@ def test_segments_without_heuristic_scores_say_so(tmp_path) -> None:
     assert out["evidence_availability"]["heuristic_scores"] == "not run"
     for s in out["segments"]:
         assert s["heuristic"] == {"available": False, "attention_risk": {"mean": None, "max": None}, "moment_quality": {"mean": None, "max": None}}
+
+
+def test_even_segments_are_chosen_from_the_duration_alone() -> None:
+    from hookline.dropoffs import even_segments
+
+    def curve(n):
+        return [0.93 ** t for t in range(n + 1)]
+    for n, count in ((12, 3), (30, 8), (60, 12), (120, 12), (4, 1)):
+        segs = even_segments(curve(n), 1.0)
+        assert len(segs) == count and segs[0]["start_s"] == 0 and segs[-1]["end_s"] == n
+        assert all(a["end_s"] == b["start_s"] for a, b in zip(segs, segs[1:]))
+        lengths = [s["end_s"] - s["start_s"] for s in segs]
+        assert max(lengths) - min(lengths) <= 1                                   # evenly divided: whole seconds, lengths differ by at most one
+    assert [(s["start_s"], s["end_s"]) for s in even_segments(curve(12), 1.0)] == [(0, 4), (4, 8), (8, 12)]
+    assert even_segments([1.0], 0.0) == []
+
+
+def test_embedded_page_data_survives_html_comment_and_script_markers() -> None:
+    from hookline.review_page import _embed
+    data = {"t": "x <!-- y </script> z", "n": 1}
+    assert json.loads(_embed(data)) == data and "<" not in _embed(data)
+
+
+def test_a_gemini_analysis_of_an_older_segmentation_is_stale(tmp_path) -> None:
+    from hookline.gemini_edit import segments_key
+    from hookline.segment_recommendations import build_segment_recommendations
+    d = video_dir(tmp_path)
+    assert write_dropoffs(d)
+    dr = json.loads((d / DROPOFFS_FILE).read_text())
+    gem = {"measured": True, "ttcc_cache_key": "k", "segments_key": segments_key([{"id": "s0", "start_s": 0, "end_s": 99}]),
+           "analysis": {"segments": [{"segment_id": "s0", "summary": "old", "observations": [], "hypothesis": "", "hypothesis_confidence": None, "suggestions": []}], "overall": None}}
+    write(d, "gemini_edit.json", gem)
+    assert build_segment_recommendations(d)["gemini"]["stale"] is True
+    write(d, "gemini_edit.json", gem | {"segments_key": segments_key(dr["segments"])})
+    assert build_segment_recommendations(d)["gemini"]["stale"] is False

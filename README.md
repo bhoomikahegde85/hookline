@@ -204,6 +204,18 @@ fMRI responses (an average subject on the fsaverage5 cortex, at 1 s steps) in `t
 measured at that moment (words, text, cuts, quiet audio), with unvalidated rule-based candidate causes. It reads saved files only. See
 [docs/ttcc.md](docs/ttcc.md).
 
+## Try a video in the browser (upload page)
+
+```bash
+python3 scripts/serve_app.py --open        # http://127.0.0.1:8770, this machine only
+```
+
+Choose a video, tick what may be sent where (your TTCC Space and Google Gemini are both required), and watch the steps: features, speech and text, TTCC on your
+Space (the first 10 s), Gemini, scores, review page. About 2 minutes for a short clip. Needs `TTCC_ENDPOINT_URL` and `HF_TOKEN` and `GEMINI_API_KEY` in
+the untracked `.env`, and the Space running (pause it afterwards: it bills while idle). The result page shows where attention is predicted to drop, what was on screen there,
+rule-based and Gemini edit suggestions, and 0 to 100 positions (hook, breakout) each next to the measured accuracy of the model behind it. All of it is model prediction, not
+audience data, and none of it says a video will or will not go viral (see `docs/evaluation.md`). The same pipeline from the terminal: `python3 scripts/run_e2e.py my.mp4 --allow-remote --gemini-allow-remote --hook-s 10`.
+
 ## Feature outputs
 
 | File | Contents |

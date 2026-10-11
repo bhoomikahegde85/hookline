@@ -124,7 +124,7 @@ def test_valid_answer_passes_and_is_labelled_a_hypothesis(tmp_path) -> None:
     assert art["status"] == "available" and art["measured"] and art["sent"] and t.closed
     seg = art["analysis"]["segments"][0]
     assert seg["suggestions"][0]["status"].startswith("hypothesis") and seg["suggestions"][0]["edit"] == {"type": "trim", "start_s": 0.0, "end_s": 1.0}
-    assert art["validation"]["dropped"] == 0 and art["validation"]["issues"] == ["no usable entry for segment(s) ['s1', 's2']"]  # said out loud
+    assert art["validation"]["dropped"] == 0 and art["validation"]["issues"] == ["no usable entry for segment(s) ['s1']"]  # said out loud
     assert art["usage"] == {"total_token_count": 1234}
     assert ENV["GEMINI_API_KEY"] not in json.dumps(art) and "validated" in art["note"]
 
@@ -159,7 +159,19 @@ def test_validation_drops_what_is_not_grounded(tmp_path) -> None:
     capped, v2 = validate({"segments": [{"segment_id": "s0", "summary": "", "observations": [], "hypothesis": "", "hypothesis_confidence": None,
                                          "suggestions": [sug() for _ in range(5)]}]}, pack, replace(CFG, max_suggestions_per_segment=2))
     assert len(capped["segments"][0]["suggestions"]) == 2 and any("beyond the cap" in i for i in v2["issues"])
-    assert validate("nope", pack, CFG)[0] == {"segments": [], "overall": None}
+    assert validate("nope", pack, CFG)[0] == {"segments": [], "overall": None, "audio": None}
+
+
+def test_audio_read_is_kept_only_when_well_formed_and_inside_the_clips() -> None:
+    from hookline.gemini_edit import _clean_audio
+    good = {"kind": "song", "description": "A pop song under a spoken line.", "energy": "high", "familiarity": "May be a generic upbeat track.",
+            "changes": [{"at_s": 2.0, "what": "music drops"}, {"at_s": 99.0, "what": "outside"}, {"at_s": 3.0, "what": ""}]}
+    a = _clean_audio(good, [[0.0, 10.0]])
+    assert a["kind"] == "song" and a["energy"] == "high" and a["changes"] == [{"at_s": 2.0, "what": "music drops"}] and "not a statement that any sound is trending" in a["status"]
+    assert _clean_audio(good | {"fit": {"verdict": "clashes", "reason": "calm visuals, loud techno"}}, [[0.0, 10.0]])["fit"]["verdict"] == "clashes"
+    assert _clean_audio(good | {"fit": {"verdict": "great"}}, [[0.0, 10.0]])["fit"] is None
+    assert _clean_audio({"kind": "banger"}, [[0.0, 10.0]]) is None and _clean_audio("x", [[0.0, 10.0]]) is None
+    assert _clean_audio(good | {"energy": "extreme"}, [[0.0, 10.0]])["energy"] is None
 
 
 # ---------------------------------------------------------------- gate, failures, key handling
@@ -350,26 +362,30 @@ def test_page_shows_gemini_and_its_trims_work_in_chrome(tmp_path) -> None:
     assert "Gemini overview" in out and "Gemini: what it observed" in out  # rendered into the DOM, not only present in the source
 
 
-def test_e2e_gemini_step_is_optional_and_gated(tmp_path) -> None:
+def test_e2e_gemini_step_is_required_and_gated(tmp_path) -> None:
     import importlib.util
     spec = importlib.util.spec_from_file_location("run_e2e", PROJECT_ROOT / "scripts" / "run_e2e.py")
     e2e = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(e2e)
     base = dict(allow_remote=True, approve="FC002", siglip=False, skip_local=False, open_page=False)
-    assert len(e2e.plan(tmp_path / "v.mp4", tmp_path, **base)) == 4  # off by default
-    steps = e2e.plan(tmp_path / "FC002.mp4", tmp_path, gemini=True, gemini_allow_remote=True, **base)
+    steps = e2e.plan(tmp_path / "FC002.mp4", tmp_path, gemini_allow_remote=True, **base)
+    assert len(steps) == 9  # Gemini is always part of the plan
     g = steps[3]
-    assert "Gemini" in g["name"] and g["optional"] and "--gemini-allow-remote" in g["cmd"] and g["cmd"][g["cmd"].index("--gemini-approve") + 1] == "FC002"
-    assert "run_gemini_edit.py" in g["cmd"][1] and ".venv-models/" in g["cmd"][0] and steps[4]["name"].startswith("segments")
-    assert e2e.plan(tmp_path / "v.mp4", tmp_path, gemini=True, **base)[3]["skip"]  # no upload permission, no step
+    assert "Gemini" in g["name"] and not g.get("optional") and "--gemini-allow-remote" in g["cmd"] and g["cmd"][g["cmd"].index("--gemini-approve") + 1] == "FC002"
+    assert "run_gemini_edit.py" in g["cmd"][1] and ".venv-models/" in g["cmd"][0] and steps[4]["name"].startswith("music") and steps[5]["name"].startswith("popularity") and steps[6]["name"].startswith("scores") and steps[7]["name"].startswith("explain") and steps[8]["name"].startswith("segments")
+    assert e2e.plan(tmp_path / "v.mp4", tmp_path, **base)[3]["skip"]  # no upload permission, no step
     calls = []
 
     def run(cmd, cwd=None, capture_output=True, text=True):
         calls.append(cmd)
+        if "run_ttcc.py" in cmd[1]:
+            d = tmp_path / "features" / "FC002"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "ttcc_status.json").write_text(json.dumps({"status": "success"}))
         return subprocess.CompletedProcess(cmd, 1 if "run_gemini_edit.py" in cmd[1] else 0, stdout="boom", stderr="")
     page = tmp_path / "features" / "FC002" / "review.html"
     page.parent.mkdir(parents=True)
     page.write_text("x")
     logs = []
-    code = e2e.run_e2e(tmp_path / "FC002.mp4", tmp_path, run=run, log=logs.append, gemini=True, gemini_allow_remote=True, **base)
-    assert code == 0 and len(calls) == 5 and any("continuing without it" in line for line in logs)  # Gemini failing does not stop the review page
+    code = e2e.run_e2e(tmp_path / "FC002.mp4", tmp_path, run=run, log=logs.append, gemini_allow_remote=True, **base)
+    assert code == 1 and not any("build_review" in " ".join(map(str, c)) for c in calls) and not any("continuing without it" in line for line in logs)  # Gemini failing stops the analysis: it is required

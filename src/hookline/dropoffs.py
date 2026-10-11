@@ -27,7 +27,10 @@ from pathlib import Path
 from typing import Any
 
 DROPOFFS_FILE = "ttcc_dropoffs.json"
-DROPOFFS_VERSION = "1"
+DROPOFFS_VERSION = "2"  # 2: even, duration-based segments (was: runs of similar seconds, which merged everything after the opening)
+SEGMENT_TARGET_S = 4
+MAX_SEGMENTS = 12
+SEGMENT_MIN_LOSS = 0.01  # a segment that loses less than this much of the audience is not flagged as a decline
 THRESHOLDS = {
     "steep_relative_loss": 0.15,   # >= 15 % of the viewers still watching are lost within one second ...
     "steep_min_drop": 0.02,        # ... and the fall is at least 0.02 in absolute terms (ignores tiny tails)
@@ -101,6 +104,39 @@ def merge_runs(seconds: list[dict], total_loss: float) -> list[dict]:
         run.append(sec)
     close()
     return intervals
+
+
+def even_segments(retention: list[float], total_loss: float, target_s: int = SEGMENT_TARGET_S, max_segments: int = MAX_SEGMENTS) -> list[dict]:
+    """Consecutive segments of (nearly) equal length over the whole predicted span, chosen from the duration alone: about ``target_s`` seconds
+    each (0-4, 4-8, ...), at most ``max_segments`` (a 120 s video gets 12 segments of 10 s). Boundaries are whole seconds, so lengths differ by at
+    most one second. Each segment is typed from its own predicted fall: steep_drop (it contains a steep second), sustained_decline (a steady fall
+    that is large enough to matter), holds (nearly flat) or unflagged (a small ordinary fall)."""
+    horizon = len(retention) - 1
+    if horizon < 1:
+        return []
+    n = min(max_segments, max(1, round(horizon / target_s)))
+    if horizon >= 2 * target_s:
+        n = max(n, 2)
+    bounds = [round(i * horizon / n) for i in range(n + 1)]
+    seconds = classify_seconds(retention)
+    out = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b <= a:
+            continue
+        inside = seconds[a:b]
+        loss = retention[a] - retention[b]
+        rel = (1 - (retention[b] / retention[a]) ** (1 / (b - a))) if retention[a] > 0 and retention[b] > 0 else 1.0  # mean per-second relative loss
+        if any(x["kind"] == "steep" for x in inside):
+            kind = "steep_drop"
+        elif rel >= THRESHOLDS["decline_relative_loss"] and loss >= SEGMENT_MIN_LOSS:
+            kind = "sustained_decline"
+        elif rel < THRESHOLDS["hold_relative_loss"]:
+            kind = "holds"
+        else:
+            kind = "unflagged"
+        out.append({"kind": kind, "start_s": a, "end_s": b, "retention_start": retention[a], "retention_end": retention[b], "loss": loss,
+                    "share_of_total_predicted_loss": loss / total_loss if total_loss > 0 else None})
+    return out
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
@@ -232,7 +268,7 @@ def analyze(d: Path) -> dict | None:
                  for s in (scores or {}).get("segments") or []] or None
     seconds = classify_seconds(retention)
     total = retention[0] - retention[-1]
-    intervals = merge_runs(seconds, total)
+    intervals = even_segments(retention, total)
     for n, iv in enumerate(intervals):
         iv["id"] = f"d{n}"
         iv["observed"] = ev.observed(iv["start_s"], iv["end_s"])

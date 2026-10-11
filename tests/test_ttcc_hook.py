@@ -162,3 +162,29 @@ def test_sanity_results_and_flags(tmp_path, monkeypatch) -> None:
     assert (run_dir / "sanity_results.csv").read_text().startswith("video_id,variant,R1,R3,R5,R10")
     text = (run_dir / "sanity_results.json").read_text()
     assert "hf_" not in text and "AIza" not in text
+
+
+# ---------------------------------------------------------------- codecs the runner cannot read (VP9: 4 of 110 reels failed with KeyError 'video_fps')
+
+@needs_ffmpeg
+def test_a_vp9_video_is_converted_to_h264_before_it_is_sent(tmp_path, monkeypatch) -> None:
+    from test_ttcc import ffmpeg
+    src = tmp_path / "vp9clip.webm"
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=64x112:r=10:d=8", "-an", "-c:v", "libvpx-vp9", "-b:v", "200k", str(src))
+    assert ttcc.video_codec(src) == "vp9"
+    runner = FakeRunner()
+    rec = run_ttcc([VideoInput("vp9clip", src)], tmp_path, ENABLED, runner, **QUIET)["records"][0]
+    sent = Path(runner.requests[0]["jobs"][0]["video_path"])
+    assert rec["status"] == SUCCESS and sent != src.resolve() and sent.name == "vp9clip.mp4" and ttcc.video_codec(sent) == "h264"
+    art = json.loads((tmp_path / "features" / "vp9clip" / RETENTION_FILE).read_text())
+    assert art["input"]["normalised"].startswith("vp9 -> h264") and art["source_path"] == str(src)             # the original stays the identity
+    assert art["source_sha256"] == ttcc.file_sha256(src)
+    h264 = tmp_path / "h264clip.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=64x112:r=10:d=8", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(h264))
+    r2 = FakeRunner()
+    run_ttcc([VideoInput("h264clip", h264)], tmp_path / "b", ENABLED, r2, **QUIET)
+    assert Path(r2.requests[0]["jobs"][0]["video_path"]) == h264.resolve()                                       # readable codecs are sent as they are
+    monkeypatch.setattr(ttcc, "normalised_copy", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    r3 = FakeRunner()
+    rec3 = run_ttcc([VideoInput("vp9clip", src)], tmp_path / "c", ENABLED, r3, **QUIET)["records"][0]
+    assert rec3["status"] == "failed" and "could not convert" in rec3["reason"] and r3.requests == []             # a failed conversion is reported, nothing is sent

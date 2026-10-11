@@ -1,3 +1,24 @@
+# Update 2026-10-11 (read this first)
+
+Full TRIBE coverage (run `20261011T031947Z`, 99 regular reels with TRIBE output; 2 reels failed on TRIBE's transcript alignment: FL004, OL009):
+
+| model | n | AUC | 95% CI | perm p |
+|---|---|---|---|---|
+| tribe_only | 99 | 0.458 | [0.344, 0.522] | 0.74 |
+| ttcc_plus_tribe | 99 | 0.493 | [0.372, 0.574] | 0.57 |
+| measured_plus_ttcc_plus_tribe | 99 | 0.581 | [0.474, 0.692] | 0.11 |
+| measured_plus_ttcc (100 reels) | 100 | 0.617 | [0.491, 0.715] | 0.036 |
+
+TRIBE shows no signal for beating a page's usual views and adds nothing to TTCC or the measured features. It is kept only as a separate, labelled
+experimental popularity score (never combined with TTCC); the page shows "no signal found" with its AUC beside the number. An earlier 39-reel run (0.54) was too small to mean anything.
+
+Other checks, same 100 regular reels:
+- Predicted hold (mean of R3, R5, R10) in quartiles: bottom quarter beat their page median 40%, middle half 58%, top quarter 44% (all reels 50%). Not monotone.
+- Measured features vs over-performance (Spearman): cuts per second -0.01, motion +0.23 (p=0.02), loudness +0.12, first word -0.05.
+- Demucs, first 5 s: voice loudness +0.26 (p=0.01), music loudness -0.16 (p=0.12), music minus voice -0.22 (p=0.03). Four related tests; exploratory, not used.
+- |motion percentile - loudness percentile| (a crude audio-visual mismatch): +0.01 (p=0.93).
+- TTCC curves across reels: 99% of the between-reel difference is one scale factor; 3 s hold sd 2.8 points (median 19%).
+
 # TTCC vs TRIBE v2: what is verified, what is not, and how to decide
 
 Status date: 2026-10-10. This file separates **measured** facts from **untested** claims.
@@ -94,22 +115,76 @@ regular reels have a TTCC hook prediction, and are compared with `measured` on t
 Metrics: AUC (binary), Spearman (continuous), 95% creator-level bootstrap intervals (2,000), paired differences, permutation tests (1,000
 shuffles, whole cross-validation re-run each time). Outputs: `01-Hookline/evaluation/<timestamp>/` (see the README there).
 
-### First run (2026-10-10, `01-Hookline/evaluation/20261010T172437Z/`), no TTCC predictions yet
+### Metric correction (read this first)
 
-| model | AUC | 95% CI | Spearman | 95% CI | permutation p (AUC) |
-|---|---|---|---|---|---|
-| constant | 0.500 | – | – | – | – |
-| follower_band | 0.259 | 0.163–0.366 | −0.432 | −0.610 – −0.233 | 0.93 |
-| duration | 0.563 | 0.447–0.675 | 0.095 | −0.105 – 0.280 | 0.046 |
-| measured | 0.578 | 0.461–0.691 | 0.118 | −0.089 – 0.308 | 0.071 |
-| measured_plus_ttcc / ttcc_only | not run: no TTCC hook predictions (the Space has no credits) | | | | |
+The first run (`20261010T172437Z`) pooled all held-out scores before computing AUC. That biases weak and category-only models **below** their true
+value, because each fold's model is trained on the other folds (a fold whose reels do well is trained on reels that do worse). A face/faceless
+feature whose raw AUC is 0.64 scored 0.47 that way. The metrics are now computed **inside each held-out fold** and averaged over folds and repeats
+(`views_eval.foldwise_metrics`), with a regression test. Numbers from `20261010T172437Z` should not be quoted; use the run below or later.
+
+### Second run (2026-10-10, `01-Hookline/evaluation/20261010T180015Z/`), no TTCC or TRIBE predictions yet
+
+| model | AUC | 95% CI | Spearman | permutation p (AUC) |
+|---|---|---|---|---|
+| constant | 0.500 | – | – | – |
+| follower_band | 0.413 | 0.346–0.498 | −0.134 | 0.92 |
+| duration | 0.592 | 0.481–0.699 | 0.146 | 0.077 |
+| **page_type** (face / faceless, dataset metadata) | **0.643** | **0.551–0.729** | 0.235 | **0.008** |
+| measured (8 opening features) | 0.598 | 0.463–0.681 | 0.149 | 0.065 |
+| measured + page_type | 0.612 | 0.486–0.706 | 0.163 | 0.048 |
+| ttcc_only, measured + ttcc, tribe_only, ttcc + tribe, measured + ttcc + tribe | not run: no TTCC or TRIBE outputs for the reference reels yet | | | |
+
+Paired AUC differences (95% bootstrap interval): `page_type − constant` +0.05 to +0.23 (above 0); `measured − constant` −0.04 to +0.18;
+`measured − duration` −0.16 to +0.13; `measured + page_type − measured` −0.02 to +0.07.
 
 Reading it honestly:
-- **No model is shown to beat chance.** `measured` has AUC 0.578, but its interval includes 0.5 and p = 0.07; `measured − duration` is
-  −0.13 to +0.17. `duration` has p = 0.046 on the permutation test while its bootstrap interval includes 0.5: borderline at best.
-- `follower_band` is far *below* 0.5 by construction, not by information: the label is centred on each band's median, so a band-mean model
-  fitted without the held-out reel is pushed the wrong way (leaving a positive out lowers its band's training mean). Its permutation
-  p = 0.93 confirms there is no signal. It is a leakage check: band alone cannot predict a band-relative label.
-- Outliers: `measured` ranks them low (median rank 67 of 110, AUC 0.375 against regular reels); `duration` puts them higher (median rank 34,
-  AUC 0.63). Ten reels: a case study, not a result.
-- 100 reels can detect only a fairly strong effect; an AUC near 0.6 would need more data to confirm.
+- **One result is distinguishable from chance: page type.** Face reels beat their band's median 64 % of the time, faceless 36 % (AUC 0.64, interval above 0.5,
+  permutation p = 0.008). That is the dataset's folder label, not something computed from the video; to use it on a new upload it must be measured (a face detector
+  on the first seconds) or supplied. It may also reflect how the organisers sampled reels, not something that generalises.
+- **The measured opening features are not shown to beat chance** (interval 0.46–0.68, p = 0.065), and not shown to beat duration alone. Adding page type to them
+  gives no clear gain either (difference −0.02 to +0.07).
+- `follower_band` stays below 0.5 by construction (the label is centred on each band's median, so band cannot predict it and the held-out fold bias still shows); its
+  p = 0.92 confirms no signal. It is a leakage check.
+- Outliers (scored by models that never saw their creator): `measured` ranks them low (median rank 67 of 110, AUC 0.375 against regular reels); `page_type` and
+  `duration` put them near the middle (median ranks 32 and 34). Ten reels: a case study, not a result.
+- 100 reels detect only a fairly strong effect.
+
+### Exploratory: a person on screen in the first 3 s (video-computed stand-in for face / faceless)
+
+A new upload does not come with the dataset's page type, so a video-computed proxy was tried: SigLIP's existing per-frame zero-shot scores for "a person in close-up" and
+"a person speaking to the camera" over the first 3 s (`person_only`, `measured_plus_person`; run `20261010T182305Z`). It matches the folder label with AUC 0.75 (72 % accuracy
+at the best threshold, in-sample), and as a predictor of beating the band median it reaches AUC 0.58 (interval 0.51–0.70, permutation p = 0.11): suggestive, not shown, and weaker
+than the folder label itself (0.64). This group was added *after* the first two runs, so treat it as a hypothesis to confirm on new reels, not as a result.
+
+### Third run: with TTCC hook predictions for all 110 reels (2026-10-11, `01-Hookline/evaluation/20261010T192956Z/`)
+
+TTCC hook predictions (10 s opening, native single pass on the L4 Space) exist for all 110 reels (4 VP9 reels needed a one-time H.264 conversion; the runner's video reader failed on VP9).
+
+| model | AUC | 95% CI | Spearman | permutation p (AUC) |
+|---|---|---|---|---|
+| measured (8 opening features) | 0.598 | 0.463–0.681 | 0.149 | 0.065 |
+| ttcc_only (R3, R5, R10, steepest early drop) | 0.526 | 0.409–0.627 | 0.148 | 0.35 |
+| measured + ttcc | 0.617 | 0.491–0.715 | 0.215 | 0.036 |
+
+Paired: `measured + ttcc − measured` AUC −0.04 to +0.10, Spearman −0.01 to +0.20 (no demonstrated gain). Pre-specified directional check (predicted hold should relate positively to
+overperformance; Spearman over 100 regular reels, 95% creator bootstrap, one-sided permutation p): R(3) rho +0.13 [−0.06, +0.32] p = 0.09; R(5) +0.13 p = 0.10; R(10) +0.10 p = 0.17.
+TTCC's R(3) varies little across these reels (0.12 to 0.26, median 0.19).
+
+Honest reading: TTCC's predicted early hold has the sign we would hope for but is **not shown** to relate to how far a reel beats its page's usual views, and adding it to the measured features does
+not demonstrably improve prediction. This is the expected outcome (retention is one ingredient of reach; views also depend on distribution) and is why Hookline presents TTCC as a hook / drop
+diagnostic and does not claim to predict virality. Outliers: `measured + ttcc` ranks the 10 extreme viral reels at median 60.5 of 110 (AUC 0.46 vs regular reels), `ttcc_only` 61.5 (0.52): a content model
+does not find breakout reels.
+
+### Scores for a video (`scripts/score_video.py`)
+
+`hook_scores.json` per video: a **hook score** (percentile of TTCC's predicted early hold among the reference reels' predictions; needs TTCC on the reference set),
+a **breakout score** (percentile of the predicted overperformance among the reference reels' held-out predictions) and the predicted retention at 1/3/5/10 s. Each carries
+the measured accuracy of the model behind it (AUC, interval, permutation p, and a plain verdict). The model follows a fixed rule: `measured_plus_ttcc` when TTCC exists
+for the video and for 30 or more reference reels, else `measured_plus_page_type` when a page type is given, else `measured`. These are positions, not verdicts; the page labels
+the breakout score "experimental" while its interval includes chance.
+
+### TRIBE (not yet run)
+
+`eval_views.py --tribe-artifacts artifacts/tribe` adds eight summaries of TRIBE's predicted brain response over the first 10 s as a feature group and runs `tribe_only`,
+`ttcc_plus_tribe` and `measured_plus_ttcc_plus_tribe`, each compared with its smaller sibling on the same reels (e.g. `ttcc_plus_tribe − ttcc_only` on the reels that have both).
+TRIBE predicts fMRI-like responses, not retention; whether it helps is what this tests. Not run: only 1 reel has TRIBE output.

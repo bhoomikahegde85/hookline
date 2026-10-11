@@ -26,8 +26,8 @@ explanation is phrased as a hypothesis, and **nothing is validated against real 
 ```bash
 uv pip install --python .venv-models/bin/python -r requirements-models.txt     # includes google-genai
 # put GEMINI_API_KEY=<new key> in .env (untracked)
-# with the whole pipeline (optional step before the review page):
-python3 scripts/run_e2e.py <video> --allow-remote --gemini --gemini-allow-remote [--approve <id>] --open
+# with the whole pipeline (a required step before the review page):
+python3 scripts/run_e2e.py <video> --allow-remote --gemini-allow-remote [--approve <id>] --open
 # or on an analysed video:
 .venv-models/bin/python scripts/run_gemini_edit.py <id> --artifacts artifacts/e2e --video <file> --gemini-allow-remote [--gemini-approve <id>]
 ```

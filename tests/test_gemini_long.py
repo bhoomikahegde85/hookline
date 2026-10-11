@@ -50,7 +50,7 @@ def make_long(tmp_path: Path, n: int, drops: dict, name: str = "long") -> tuple[
     return d, video
 
 
-DROPS = {(0, 1): 0.25, (100, 106): 0.10, (200, 210): 0.14, (330, 333): 0.08}
+DROPS = {(0, 1): 0.25, (100, 106): 0.20, (200, 210): 0.22, (330, 333): 0.20}  # steep seconds inside the 12 even segments of a 400 s video (33 s each)
 
 
 def flagged(pack: dict) -> list[dict]:
@@ -104,10 +104,10 @@ def test_a_long_video_is_sent_as_the_opening_plus_flagged_segments_within_the_bu
 
 def test_budget_goes_to_the_largest_predicted_falls_first(tmp_path) -> None:
     d, _ = make_long(tmp_path, 400, DROPS)
-    tight = replace(CFG, max_analysed_s=30.0, hook_s=5.0, context_margin_s=3.0)
+    tight = replace(CFG, max_analysed_s=80.0, hook_s=5.0, context_margin_s=3.0)  # room for the opening and one 33 s segment, not two
     pack = build_evidence_pack(d, tight)
     scope = pack["analysis_scope"]
-    assert sum(b - a for a, b in scope["clips_s"]) <= 30.0
+    assert sum(b - a for a, b in scope["clips_s"]) <= 80.0
     kept = [s for s in flagged(pack) if s["analysed"]]
     dropped = [s for s in flagged(pack) if not s["analysed"]]
     assert kept and dropped
@@ -223,11 +223,11 @@ def test_a_kept_gemini_analysis_is_not_attached_to_a_newer_ttcc_curve(tmp_path) 
 def test_recommendations_say_which_segments_gemini_never_saw(tmp_path) -> None:
     from hookline.segment_recommendations import build_segment_recommendations
     d, video = make_long(tmp_path, 400, DROPS)
-    art, _ = run(d, video, replace(CFG, max_analysed_s=30.0))
+    art, _ = run(d, video, replace(CFG, max_analysed_s=80.0))
     assert write_gemini_edit(d, art)
     recs = build_segment_recommendations(d)
     scope = recs["gemini"]["scope"]
-    assert scope["whole_predicted_span"] is False and scope["not_analysed"] and scope["max_analysed_s"] == 30.0
+    assert scope["whole_predicted_span"] is False and scope["not_analysed"] and scope["max_analysed_s"] == 80.0
     skipped = {x["id"] for x in scope["not_analysed"]}
     for s in recs["segments"]:
         assert s["gemini_scope"]["analysed"] is (s["id"] not in skipped)

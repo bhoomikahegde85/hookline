@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--features", type=Path, default=PROJECT_ROOT / "artifacts" / "company" / "features", help="measured features per video")
     ap.add_argument("--ttcc-artifacts", type=Path, default=PROJECT_ROOT / "artifacts" / "hook",
                     help="artifact root whose features/<id>/ttcc_retention.json are TTCC hook predictions")
+    ap.add_argument("--tribe-artifacts", type=Path, default=PROJECT_ROOT / "artifacts" / "tribe",
+                    help="artifact root whose features/<id>/tribe.json + tribe_preds.npy are TRIBE outputs (first 10 s are used)")
     ap.add_argument("--out", type=Path, default=None, help="output root (default <data>/evaluation)")
     ap.add_argument("--seed", type=int, default=DEFAULTS["seed"])
     ap.add_argument("--folds", type=int, default=DEFAULTS["folds"])
@@ -47,24 +49,27 @@ def main(argv: list[str] | None = None) -> int:
     rows = load_dataset(args.data)
     medians = add_labels(rows)
     ttcc_root = args.ttcc_artifacts / "features" if args.ttcc_artifacts and (args.ttcc_artifacts / "features").is_dir() else None
-    coverage = assemble(rows, args.features, ttcc_root)
+    tribe_root = args.tribe_artifacts / "features" if args.tribe_artifacts and (args.tribe_artifacts / "features").is_dir() else None
+    coverage = assemble(rows, args.features, ttcc_root, tribe_root)
     print(f"{len(rows)} reels ({sum(not r['is_outlier'] for r in rows)} regular, {sum(r['is_outlier'] for r in rows)} outliers); "
-          f"TTCC hook predictions for {len(coverage['ttcc_available'])}" + ("" if ttcc_root else f" (no {args.ttcc_artifacts}/features)"))
+          f"TTCC hook predictions for {len(coverage['ttcc_available'])}" + ("" if ttcc_root else f" (no {args.ttcc_artifacts}/features)")
+          + f"; TRIBE outputs for {len(coverage['tribe_available'])}" + ("" if tribe_root else f" (no {args.tribe_artifacts}/features)"))
     results = evaluate(rows, cfg)
     run_dir = new_run_dir(args.out or (args.data / "evaluation"), stamp)
     meta = run_metadata(cfg, args.data, args.features, ttcc_root, rows, stamp)
+    meta["inputs"]["tribe_root"] = str(tribe_root) if tribe_root else None
     paths = write_outputs(run_dir, rows, medians, coverage, results, meta)
     (run_dir.parent / "LATEST").write_text(run_dir.name + "\n")
-    print(f"\n{'model':<26}{'n':>4}  {'AUC':>6}  {'95% CI':>15}  {'Spearman':>9}  {'perm p(AUC)':>11}  status")
+    print(f"\n{'model':<32}{'n':>4}  {'AUC':>6}  {'95% CI':>15}  {'Spearman':>9}  {'perm p(AUC)':>11}  status")
     for model, m in results["models"].items():
         c = (results["bootstrap_95ci"].get(model) or {}).get("auc")
         p = results["permutation"].get(model, {}).get("p_auc")
         sp = m["spearman"]
-        print(f"{model:<26}{m['n']:>4}  {m['auc']:>6.3f}  {('[%.3f, %.3f]' % tuple(c)) if c else '':>15}  {('%.3f' % sp) if sp is not None else '-':>9}  "
+        print(f"{model:<32}{m['n']:>4}  {m['auc']:>6.3f}  {('[%.3f, %.3f]' % tuple(c)) if c else '':>15}  {('%.3f' % sp) if sp is not None else '-':>9}  "
               f"{('%.4f' % p) if p is not None else '-':>11}  {results['status'][model]}")
     for model, why in results["status"].items():
         if model not in results["models"]:
-            print(f"{model:<26}  {why}")
+            print(f"{model:<32}  {why}")
     print("\noutliers (scored by models that never saw their creator): " + json.dumps(
         {m: {"auc_vs_regular": round(v["auc_outlier_vs_regular"], 3) if v["auc_outlier_vs_regular"] is not None else None,
              "median_rank": v["median_outlier_rank"], "of": v["n_ranked"]} for m, v in results["outliers"]["per_model"].items()}))

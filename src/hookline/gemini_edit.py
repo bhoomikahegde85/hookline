@@ -197,7 +197,15 @@ retention trend (retention_by_second, the whole video) to decide what matters mo
    Timestamps are seconds from the start of the ORIGINAL video and must lie inside the analysed clips ({ranges_text}). Prefer concrete edits (remove dead space between X s and Y s, bring the
    first spoken line to 0.5 s, cut the repeated text at Z s) over general advice.
 Return JSON only, matching the schema. Include "overall": a hook assessment (is the first 3 seconds' content observable and what does it contain) and the
-segment ids you consider the top priorities, in order.
+segment ids you consider the top priorities, in order. Also include "audio": what you HEAR in the whole analysed audio, since sound is a large part of
+attention: "kind" (voiceover, song, music_with_voice, ambient or silent), "description" (one or two sentences on the voice and music: who speaks, genre or
+mood, energy, whether the music is under the voice or competes with it), "energy" (low, medium or high), "familiarity" (one HEDGED sentence on whether the
+music sounds like a generic or widely used short-form track; you cannot know whether any sound is currently trending, so never claim it is), and
+"changes" (up to 5 notable audio moments: {{"at_s": ORIGINAL seconds, "what": ...}}, such as the music dropping, the voice starting or a beat change).
+Describe only what is audible; do not invent a song title or artist unless it is spoken or shown on screen.
+Inside "audio" also give "fit": does the audio suit the visuals and the mood of the video? "verdict" is "fits", "partly", "clashes" or "unclear"; "reason" is one
+hedged sentence naming what you see and what you hear (for example a calm, slow video under loud techno would clash; an energetic edit on a driving beat fits).
+Judge only the match between sound and picture, not whether you like the music.
 
 If the pack has "evidence_truncated", the listed sources were cut after "last_kept_s": missing words, cuts or notes after that second mean "not included", not silence or no cut.
 
@@ -235,7 +243,14 @@ def response_schema() -> dict:
     return {"type": "object", "properties": {
         "segments": {"type": "array", "items": segment},
         "overall": {"type": "object", "properties": {"hook_assessment": {"type": "string"}, "top_priorities": {"type": "array", "items": {"type": "string"}}},
-                    "required": ["hook_assessment", "top_priorities"]}}, "required": ["segments", "overall"]}
+                    "required": ["hook_assessment", "top_priorities"]},
+        "audio": {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": list(AUDIO_KINDS)}, "description": {"type": "string"}, "energy": {"type": "string", "enum": ["low", "medium", "high"]},
+            "familiarity": {"type": "string"},
+            "fit": {"type": "object", "properties": {"verdict": {"type": "string", "enum": list(FIT_VERDICTS)}, "reason": {"type": "string"}}, "required": ["verdict", "reason"]},
+            "changes": {"type": "array", "items": {"type": "object", "properties": {"at_s": num, "what": {"type": "string"}}, "required": ["at_s", "what"]}}},
+            "required": ["kind", "description", "energy", "familiarity", "fit", "changes"]}},
+        "required": ["segments", "overall", "audio"]}
 
 
 # ---------------------------------------------------------------- validation
@@ -250,6 +265,28 @@ def _clip_text(s: Any, n: int) -> str:
     return " ".join(str(s or "").split())[:n]
 
 
+AUDIO_KINDS = ("voiceover", "song", "music_with_voice", "ambient", "silent")
+FIT_VERDICTS = ("fits", "partly", "clashes", "unclear")
+
+
+def _clean_audio(raw: Any, spans: list[list[float]]) -> dict | None:
+    """The audio read, kept only when well formed; change times outside the analysed clips are dropped."""
+    if not isinstance(raw, dict) or raw.get("kind") not in AUDIO_KINDS:
+        return None
+    inside = lambda t: t is not None and any(a - 0.5 <= t <= b + 0.5 for a, b in spans)  # noqa: E731
+    changes = []
+    for c in (raw.get("changes") or [])[:5]:
+        t = _num(c.get("at_s")) if isinstance(c, dict) else None
+        if inside(t) and c.get("what"):
+            changes.append({"at_s": round(t, 1), "what": _clip_text(c.get("what"), 200)})
+    return {"kind": raw["kind"], "description": _clip_text(raw.get("description"), 500),
+            "energy": raw.get("energy") if raw.get("energy") in ("low", "medium", "high") else None,
+            "familiarity": _clip_text(raw.get("familiarity"), 300), "changes": changes,
+            "fit": ({"verdict": raw["fit"]["verdict"], "reason": _clip_text(raw["fit"].get("reason"), 300)}
+                    if isinstance(raw.get("fit"), dict) and raw["fit"].get("verdict") in FIT_VERDICTS else None),
+            "status": "AI hypothesis from listening to the audio; not measured, and not a statement that any sound is trending"}
+
+
 def validate(raw: Any, pack: dict, cfg: GeminiConfig) -> tuple[dict, dict]:
     """Strict validation. Returns (clean analysis, {"issues": [...], "dropped": n}); never repairs, only drops."""
     issues: list[str] = []
@@ -260,7 +297,7 @@ def validate(raw: Any, pack: dict, cfg: GeminiConfig) -> tuple[dict, dict]:
     clean_segments: dict[str, dict] = {}
     dropped = 0
     if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list):
-        return {"segments": [], "overall": None}, {"issues": ["response has no 'segments' list"], "dropped": 1}
+        return {"segments": [], "overall": None, "audio": None}, {"issues": ["response has no 'segments' list"], "dropped": 1}
     for entry in raw["segments"]:
         sid = entry.get("segment_id") if isinstance(entry, dict) else None
         if sid not in segs:
@@ -334,10 +371,11 @@ def validate(raw: Any, pack: dict, cfg: GeminiConfig) -> tuple[dict, dict]:
     ov = raw.get("overall") if isinstance(raw.get("overall"), dict) else None
     overall = {"hook_assessment": _clip_text(ov.get("hook_assessment"), 600),
                "top_priorities": [p for p in (ov.get("top_priorities") or []) if p in analysed]} if ov else None
+    audio = _clean_audio(raw.get("audio"), ranges)
     missing = [sid for sid in segs if sid in analysed and sid not in clean_segments]
     if missing:
         issues.append(f"no usable entry for segment(s) {missing}")
-    return {"segments": list(clean_segments.values()), "overall": overall}, {"issues": issues[:60], "dropped": dropped}
+    return {"segments": list(clean_segments.values()), "overall": overall, "audio": audio}, {"issues": issues[:60], "dropped": dropped}
 
 
 # ---------------------------------------------------------------- permission and transport
@@ -450,6 +488,11 @@ def _scrub(text: str, secret: str | None) -> str:
     return text.replace(secret, "***") if secret else text
 
 
+def segments_key(segments: list[dict] | None) -> str | None:
+    """Identity of the segmentation Gemini's ids refer to: s3 means 16-21 s only for that exact split."""
+    return stable_hash([[s["id"], s["start_s"], s["end_s"]] for s in segments]) if segments else None
+
+
 def extract_gemini_edit(d: Path, video_path: Path, cfg: GeminiConfig, transport_factory: Callable[[str], Transport] | None = None,
                         env: dict | None = None, root: Path | None = None, dotenv: Path | None = None) -> dict | None:
     """One Gemini interpretation of the video's drop-off segments. None when disabled. Never raises: every problem is the artifact's ``reason``."""
@@ -459,7 +502,7 @@ def extract_gemini_edit(d: Path, video_path: Path, cfg: GeminiConfig, transport_
     art = _load(d / "ttcc_retention.json") or {}
     base = {"schema": "hookline.gemini_edit", "version": GEMINI_EDIT_VERSION, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "video_id": art.get("video_id") or d.name, "source_sha256": art.get("source_sha256"), "cache_key": gemini_key(d, cfg, pack),
-            "ttcc_cache_key": art.get("cache_key"),
+            "ttcc_cache_key": art.get("cache_key"), "segments_key": segments_key((pack or {}).get("ttcc", {}).get("segments")),
             "status": "failed", "measured": False, "sent": False, "reason": None, "model": cfg.model,
             "config": {k: v for k, v in cfg.to_dict().items() if k not in ("approved_ids", "protected_roots")},
             "evidence_digest": evidence_digest(pack), "note": NOTE, "usage": None, "requests": [], "upload_mb": None}

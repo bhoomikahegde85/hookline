@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .gemini_edit import ARTIFACT as GEMINI_ARTIFACT
 from .gemini_edit import NOTE as GEMINI_NOTE
+from .gemini_edit import segments_key
 
 FILE = "segment_recommendations.json"
 STATUS = "hypotheses: TTCC's curve is a prediction and Gemini's explanations are interpretations; neither is validated against audience data"
@@ -35,7 +36,8 @@ def build_segment_recommendations(d: Path) -> dict | None:
     ttcc_key = (_load(d / "ttcc_retention.json") or {}).get("cache_key")
     # Gemini's segment ids (s0, s1, ...) belong to the TTCC curve it was given. After TTCC is rerun the ids are renumbered, so a
     # kept older analysis must never be attached to the new segments.
-    stale = bool(gem and gem.get("measured") and gem.get("ttcc_cache_key") != ttcc_key)
+    seg_key = segments_key(dr.get("segments"))
+    stale = bool(gem and gem.get("measured") and (gem.get("ttcc_cache_key") != ttcc_key or gem.get("segments_key") != seg_key))
     usable = bool(gem and gem.get("measured") and gem.get("analysis")) and not stale
     gem_by_seg = {s["segment_id"]: s for s in gem["analysis"]["segments"]} if usable else {}
     scope = (gem or {}).get("analysis_scope") if usable else None
@@ -76,7 +78,7 @@ def build_segment_recommendations(d: Path) -> dict | None:
                               if stale else (gem or {}).get("reason")), "model": (gem or {}).get("model"),
                    "scope": None if not scope else {k: scope.get(k) for k in ("whole_predicted_span", "clips_s", "analysed_s", "max_analysed_s",
                                                                               "predicted_span_s", "not_analysed")},
-                   "overall": gem["analysis"]["overall"] if usable else None, "note": GEMINI_NOTE,
+                   "overall": gem["analysis"]["overall"] if usable else None, "audio": gem["analysis"].get("audio") if usable else None, "note": GEMINI_NOTE,
                    "validation": (gem or {}).get("validation")},
         "segments": segments}
 

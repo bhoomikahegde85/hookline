@@ -247,6 +247,14 @@ video is marked "not predicted". If 30 s does not fit in GPU memory the runner s
 `hook_prompt_s` (sensitivity checks only) tells the model a different length than it sees; such runs are flagged and never used for evaluation.
 Sensitivity checks (`scripts/ttcc_sanity.py`): re-encoded, black and 1-second-shuffled openings, told-length variations, and different reels.
 
+### Sanity check on real reels (2026-10-11, L4 Space, 10 s opening, 3 reels: FC002, FL031, FL002; `01-Hookline/evaluation/sanity_checks/20261010T183353Z/`)
+
+Mean absolute change in R(3), compared with re-encoding the same opening (the noise floor, 0.0033): black frames 0.040 (12x), different reels 0.065 (20x),
+1-second chunks shuffled 0.0078 (2.4x), and telling the model the ad is 45 s or 60 s long instead of 10 s: 0.001 to 0.002 (negligible). So TTCC's output depends on the
+visual content, is not driven by the told length, and is a function of the overall look more than the order of the opening. Limits: three reels; one reel (FC002) came out
+close to the black-frame baseline (0.162 vs 0.170), so the model may not separate some content from "nothing"; differences below about 0.01 in R(3) between reels are within
+re-encoding noise. An earlier run at 20 s on the 24 GB L4 ran out of memory (the runner shrank to 9 s, so R(10) was missing); 10 s fits.
+
 ## Videos longer than 30 s: overlapping windows (experimental, `--long-videos windows`)
 
 **Where the 30 s limit comes from (inspected, not assumed).** It is not a model limit. The retention head emits 60 values (`T_MAX = 60`), training used 5 to 60 s horizons

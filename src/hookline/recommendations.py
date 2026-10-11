@@ -185,7 +185,10 @@ def _repeated_text(rows: list[dict], ocr: dict | None) -> list[dict]:
     if not ocr or not ocr.get("measured"):
         return []
     events = {e["event_id"]: e for e in ocr.get("events") or []}
-    out = []
+    short_words = [e for e in events.values() if len(str(e.get("text", "")).split()) <= 1 and e.get("visible_until_s", 99) - e.get("first_seen_s", 0) <= 1.6]
+    if len(short_words) >= 6:  # word-by-word captions: a common word coming back is ordinary speech, not repeated on-screen text
+        return []
+    out, seen_starts = [], set()
     for e in ocr.get("events") or []:
         first = events.get(e.get("repeat_of"))
         if not first:
@@ -194,6 +197,12 @@ def _repeated_text(rows: list[dict], ocr: dict | None) -> list[dict]:
         segs = _segs_in(rows, s, end)
         if not segs or end <= s:
             continue
+        text = str(e.get("text", ""))
+        if sum(ch.isalpha() for ch in text) < 4 or int(s) in seen_starts:  # OCR fragments ("M+", "2") and several boxes in the same second are noise
+            continue
+        seen_starts.add(int(s))
+        if len(out) >= 3:  # a handful of examples is enough; more only buries the useful suggestions
+            break
         out.append({
             "rule": "repeated_text",
             "start_s": s, "end_s": end,

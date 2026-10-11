@@ -26,29 +26,39 @@ def load_script(name: str):
 
 
 class FakeRun:
-    def __init__(self, fail_at: int | None = None, out: str = ""):
-        self.calls, self.fail_at, self.out = [], fail_at, out
+    def __init__(self, fail_at: int | None = None, out: str = "", ttcc_status: str = "success", ttcc_reason: str | None = None, fail_script: str | None = None):
+        self.calls, self.fail_at, self.out, self.fail_script = [], fail_at, out, fail_script
+        self.ttcc_status, self.ttcc_reason = ttcc_status, ttcc_reason
 
     def __call__(self, cmd, cwd=None, capture_output=True, text=True):
         self.calls.append(cmd)
-        code = 1 if self.fail_at == len(self.calls) else 0
+        if any(str(c).endswith("run_ttcc.py") for c in cmd):  # the real script writes ttcc_status.json and exits 0 even when TTCC was unavailable
+            d = Path(cmd[cmd.index("--artifacts") + 1]) / "features" / Path(cmd[cmd.index("--input") + 1]).stem
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "ttcc_status.json").write_text(json.dumps({"status": self.ttcc_status, "reason": self.ttcc_reason}))
+        code = 1 if (self.fail_at == len(self.calls) or (self.fail_script and any(self.fail_script in str(c) for c in cmd))) else 0
         return subprocess.CompletedProcess(cmd, code, stdout=self.out if code else "done\n", stderr="")
 
 
 def opts(**over):
-    return dict(allow_remote=True, approve=None, siglip=False, skip_local=False, open_page=False) | over
+    return dict(allow_remote=True, approve=None, siglip=False, skip_local=False, open_page=False, gemini_allow_remote=True) | over
 
 
 def test_plan_orders_the_five_steps_and_passes_flags(tmp_path) -> None:
     e2e = load_script("run_e2e")
     video = tmp_path / "FC002.mp4"
     steps = e2e.plan(video, tmp_path / "root", **opts(approve="FC002", siglip=True))
-    assert [s["name"].split(" ")[0] for s in steps] == ["features", "speech", "retention", "segments"]
+    assert [s["name"].split(" ")[0] for s in steps] == ["features", "speech", "retention", "explanation", "music", "popularity", "scores:", "explain:", "segments"]
     assert steps[0]["cmd"][1].endswith("run_pipeline.py") and ".venv/" in steps[0]["cmd"][0]
     assert steps[1]["cmd"][1].endswith("run_speech_ocr.py") and ".venv-models/" in steps[1]["cmd"][0] and "--siglip" in steps[1]["cmd"]
     ttcc = steps[2]["cmd"]
     assert "--ttcc-remote" in ttcc and "--ttcc-allow-remote" in ttcc and ttcc[ttcc.index("--ttcc-approve") + 1] == "FC002"
-    assert steps[3]["cmd"][1].endswith("build_review.py") and "--open" not in steps[3]["cmd"]
+    assert steps[3]["cmd"][1].endswith("run_gemini_edit.py") and not steps[3].get("optional") and steps[3]["skip"] is None  # Gemini is required
+    assert steps[4]["cmd"][1].endswith("run_stems.py") and not steps[4].get("optional")  # Demucs music/voice levels: local, required
+    assert steps[5]["cmd"][1].endswith("run_tribe.py") and not steps[5].get("optional")  # TRIBE popularity: a separate required step, never feeds TTCC
+    assert steps[6]["cmd"][1].endswith("score_video.py") and not steps[6].get("optional") and steps[7]["cmd"][1].endswith("explain_video.py") and not steps[7].get("optional") \
+        and steps[8]["cmd"][1].endswith("build_review.py") and "--open" not in steps[8]["cmd"]
+    assert e2e.plan(video, tmp_path / "root", **opts(gemini_allow_remote=False))[3]["skip"]
     none = e2e.plan(video, tmp_path / "root", **opts(allow_remote=False, skip_local=True))
     assert none[0]["skip"] and none[1]["skip"] and "--allow-remote" in none[2]["skip"] and "--ttcc-approve" not in none[2]["cmd"]
 
@@ -57,18 +67,17 @@ def test_remote_is_never_run_without_permission(tmp_path) -> None:
     e2e = load_script("run_e2e")
     fake, logs = FakeRun(), []
     code = e2e.run_e2e(tmp_path / "v.mp4", tmp_path / "root", run=fake, log=logs.append, **opts(allow_remote=False))
-    assert code == 1 and len(fake.calls) == 2  # features and speech ran; the upload step and everything after did not
-    assert not any("run_ttcc" in " ".join(c) for c in fake.calls)
+    assert code == 1 and not any("run_ttcc" in " ".join(c) or "run_gemini" in " ".join(c) or "build_review" in " ".join(c) for c in fake.calls)  # nothing is uploaded, and nothing after the stop ran
     assert any("--allow-remote" in line for line in logs) and any("stopping" in line for line in logs)
 
 
 def test_a_failed_step_stops_the_run_with_a_hint(tmp_path) -> None:
     e2e = load_script("run_e2e")
-    fake, logs = FakeRun(fail_at=3, out="TTCC unavailable - Space not reachable: HTTP 404"), []
+    fake, logs = FakeRun(fail_script="run_ttcc.py", out="TTCC unavailable - Space not reachable: HTTP 404"), []
     code = e2e.run_e2e(tmp_path / "v.mp4", tmp_path / "root", run=fake, log=logs.append, **opts())
-    assert code == 1 and len(fake.calls) == 3  # the review step never ran
+    assert code == 1 and not any("run_gemini" in " ".join(c) or "build_review" in " ".join(c) for c in fake.calls)  # the later steps never ran
     assert any("Space is not ready" in line for line in logs) and any("FAILED" in line for line in logs)
-    fake = FakeRun(fail_at=1, out="boom")
+    fake = FakeRun(fail_script="run_pipeline.py", out="boom")
     assert e2e.run_e2e(tmp_path / "v.mp4", tmp_path / "root", run=fake, log=lambda *_: None, **opts()) == 1 and len(fake.calls) == 1
 
 
@@ -81,6 +90,16 @@ def test_success_prints_the_review_page_path(tmp_path) -> None:
     logs = []
     assert e2e.run_e2e(video, tmp_path / "root", run=FakeRun(), log=logs.append, **opts()) == 0
     assert any(str(page.resolve()) in line for line in logs)
+
+
+def test_ttcc_unavailable_is_a_failed_step_with_its_reason(tmp_path) -> None:
+    """run_ttcc exits 0 when it did not run (video too short, not approved, ...); the pipeline must say so instead of reporting 'ok'."""
+    e2e = load_script("run_e2e")
+    fake, logs = FakeRun(ttcc_status="unavailable", ttcc_reason="duration 0.40 s is shorter than TTCC's trained range"), []
+    code = e2e.run_e2e(tmp_path / "v.mp4", tmp_path / "root", run=fake, log=logs.append, **opts())
+    assert code == 1 and not any("run_gemini" in " ".join(c) or "build_review" in " ".join(c) for c in fake.calls)  # nothing after the retention wave ran
+    assert any("TTCC unavailable: duration 0.40 s is shorter" in line for line in logs)
+    assert any("FAILED" in line and "retention" in line for line in logs)
 
 
 # ---------------------------------------------------------------- the review page
@@ -108,7 +127,9 @@ def test_review_page_is_self_contained_and_carries_the_data(tmp_path) -> None:
     assert page.name == REVIEW_FILE
     html = page.read_text()
     assert not re.search(r"https?://", html.replace("http://www.w3.org/2000/svg", ""))  # the only URL in the page is the SVG namespace id
-    assert "<script src" not in html and "<link" not in html and "fetch(" not in html and "XMLHttpRequest" not in html  # no external resource
+    assert "<script src" not in html and "<link" not in html and "XMLHttpRequest" not in html  # no external resource
+    calls = re.findall(r"fetch\(([^,)]*)", html)                                              # the page talks only to its own local server (what-if), by relative /api/ path
+    assert calls and all(c.strip().startswith(("'/api/", '"/api/')) for c in calls), calls
     assert "innerHTML" not in html and "document.write" not in html and "eval(" not in html  # data is rendered as text only
     assert video.resolve().as_uri() in html and "%20" in html  # file:// URL, percent-encoded
     data = json.loads(html.split('type="application/json">')[1].split("</script>")[0].replace("<\\/", "</"))
@@ -241,3 +262,50 @@ def test_real_video_loads_in_chrome_over_the_local_server(tmp_path) -> None:
         server.shutdown()
     m = re.search(r'<pre id="videocheck">(.*?)</pre>', out, re.S)
     assert m and "error=none" in m.group(1) and "duration=25." in m.group(1), m.group(1) if m else "page script did not run"
+
+
+@pytest.mark.skipif(CHROME is None, reason="Chrome not installed")
+def test_page_shows_scores_with_their_accuracy_in_chrome(tmp_path) -> None:
+    d, video = make_video_dir(tmp_path)
+    scores = {"schema": "hookline.hook_scores", "video_id": "v", "status": "ok", "note": "Scores are positions among reference reels.",
+              "popularity_score": {"score": 62, "reference_reels": 39, "accuracy": {"model": "tribe_only", "evaluated": True, "auc": 0.6, "auc_ci95": [0.46, 0.68],
+                                                                                   "verdict": "not shown to beat chance on these reels (the 95% interval includes 0.5)"}},
+              "hook_score": {"score": None, "reason": "only 0 reference reels have TTCC predictions; 30 are needed"}, "retention_pct": {"1s": 43, "3s": 19, "5s": 14, "10s": 8}}
+    (d / "hook_scores.json").write_text(json.dumps(scores))
+    page = build_review(d, video)
+    out = subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--virtual-time-budget=5000", "--dump-dom", page.resolve().as_uri() + "#selftest"],
+                         capture_output=True, text=True, timeout=120).stdout
+    m = re.search(r'<pre id="selftest">(.*?)</pre>', out, re.S)
+    assert m and m.group(1).startswith("SELFTEST PASS") and "three score gauges" in m.group(1), m.group(1) if m else "page script did not run"
+    assert "not shown to beat chance" in out and "POPULARITY (TRIBE, experimental)" in out and "needs TTCC on the reference set" in out
+    assert "will go viral" not in out.lower().replace("not a statement that a video will or will not go viral", "")
+
+
+def test_skip_local_does_not_stop_the_run(tmp_path) -> None:
+    e2e = load_script("run_e2e")
+    logs = []
+    e2e.run_e2e(tmp_path / "v.mp4", tmp_path, run=FakeRun(), log=logs.append, **opts(skip_local=True, gemini_allow_remote=True))
+    assert not any("stopping" in line for line in logs) and any("retention" in line and "..." in line for line in logs)
+
+
+def test_spaces_are_woken_at_the_start_and_before_each_remote_step(tmp_path) -> None:
+    e2e = load_script("run_e2e")
+    woken = []
+    e2e.run_e2e(tmp_path / "v.mp4", tmp_path, run=FakeRun(), log=lambda _l: None, wake=woken.append, **opts(gemini_allow_remote=True))
+    assert woken[0] == "start" and sorted(woken[1:]) == ["tribe", "ttcc"]  # the two remote steps run at the same time, so their order is not fixed
+
+
+def test_independent_steps_really_run_at_the_same_time(tmp_path) -> None:
+    import threading
+    e2e = load_script("run_e2e")
+    gate = threading.Barrier(2, timeout=10)  # speech and the retention step must be in flight together, or this raises BrokenBarrierError
+    inner = FakeRun()
+
+    def run(cmd, cwd=None, capture_output=True, text=True):
+        if any(str(c).endswith(("run_speech_ocr.py", "run_ttcc.py")) for c in cmd):
+            gate.wait()
+        return inner(cmd, cwd=cwd, capture_output=capture_output, text=text)
+    page = tmp_path / "root" / "features" / "v" / "review.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("x")
+    assert e2e.run_e2e(tmp_path / "v.mp4", tmp_path / "root", run=run, log=lambda _l: None, **opts(gemini_allow_remote=True)) == 0
