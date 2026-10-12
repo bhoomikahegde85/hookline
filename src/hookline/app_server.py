@@ -19,6 +19,7 @@ import json
 import mimetypes
 import re
 import secrets
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -128,6 +129,37 @@ class App:
         for p in sorted((self.root / "features").glob("UP*/review.html"), key=lambda q: q.stat().st_mtime, reverse=True)[:12]:
             out.append({"id": p.parent.name, "url": f"/review/{p.parent.name}/"})
         return out
+
+
+MAX_SHORT_SIDE = 720  # larger uploads are shrunk: a 1080x1920 clip needs more GPU memory than the 22 GB TTCC Space has
+
+
+def shrink_for_model(path: Path, run=subprocess.run) -> Path:
+    """Return a copy of the video whose short side is at most 720 px (an .mp4 next to it), or the original when it is already small
+    or ffmpeg fails. The prediction models see the smaller copy; frames are scaled, nothing else changes."""
+    try:
+        probe = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+                    capture_output=True, text=True, timeout=60)
+        w, h = (int(x) for x in probe.stdout.strip().split(",")[:2])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return path
+    if min(w, h) <= MAX_SHORT_SIDE:
+        return path
+    out = path.with_name(path.stem + "_small.mp4")
+    scale = f"scale={MAX_SHORT_SIDE}:-2" if w <= h else f"scale=-2:{MAX_SHORT_SIDE}"
+    try:
+        proc = run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-vf", scale, "-c:v", "libx264", "-crf", "20", "-c:a", "aac", "-movflags", "+faststart", str(out)],
+                   capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.SubprocessError):
+        out.unlink(missing_ok=True)
+        return path
+    if proc.returncode != 0 or not out.is_file():
+        out.unlink(missing_ok=True)
+        return path
+    final = path.with_suffix(".mp4")
+    path.unlink(missing_ok=True)
+    out.replace(final)
+    return final
 
 
 def make_handler(app: App, port_holder: dict):
@@ -273,6 +305,7 @@ def make_handler(app: App, port_holder: dict):
                     tmp.unlink(missing_ok=True)
                     return self._json(400, {"error": "the upload was cut short"})
                 tmp.replace(dest)
+                dest = shrink_for_model(dest)
                 job = Job(job_id, dest, {"remote": True, "gemini": True, "original_name": Path(name).name[:80]})
                 app.jobs[job_id] = job
                 app.start(job)

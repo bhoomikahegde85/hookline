@@ -418,6 +418,7 @@ class GenaiTransport:
         self.client = client or self.genai.Client(api_key=api_key, http_options=self.types.HttpOptions(timeout=int(cfg.timeout_s * 1000)))
         self.uploaded: Any = None
         self.requests: list[dict] = []
+        self.model_used: str | None = None
 
     def _upload(self, path: Path) -> Any:
         if self.uploaded is None:
@@ -451,21 +452,30 @@ class GenaiTransport:
         contents = [t.Content(role="user", parts=[*parts, t.Part(text=prompt)])]
         config = t.GenerateContentConfig(system_instruction=system, temperature=self.cfg.temperature, response_mime_type="application/json",
                                          response_json_schema=schema, media_resolution=f"MEDIA_RESOLUTION_{self.cfg.media_resolution.upper()}")
-        wait = 2.0
-        for attempt in range(1, self.cfg.max_retries + 2):
-            t0 = time.perf_counter()
-            try:
-                resp = self.client.models.generate_content(model=self.cfg.model, contents=contents, config=config)
-                self.requests.append({"attempt": attempt, "ok": True, "seconds": round(time.perf_counter() - t0, 2)})
-                um = getattr(resp, "usage_metadata", None)
-                usage = {k: getattr(um, k, None) for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count", "total_token_count")} if um else {}
-                return resp.text or "", usage
-            except Exception as exc:
-                self.requests.append({"attempt": attempt, "ok": False, "error": type(exc).__name__, "seconds": round(time.perf_counter() - t0, 2)})
-                if not _retryable(exc) or attempt > self.cfg.max_retries:
-                    raise
-                self.sleep(wait)
-                wait *= 2
+        models = [self.cfg.model, *[m for m in self.cfg.fallback_models if m != self.cfg.model]]
+        for mi, model in enumerate(models):
+            last = mi == len(models) - 1
+            retries = self.cfg.max_retries if last else min(1, self.cfg.max_retries)  # a busy model is abandoned quickly while another can answer
+            wait = 5.0
+            for attempt in range(1, retries + 2):
+                t0 = time.perf_counter()
+                try:
+                    resp = self.client.models.generate_content(model=model, contents=contents, config=config)
+                    self.requests.append({"attempt": attempt, "ok": True, "model": model, "seconds": round(time.perf_counter() - t0, 2)})
+                    self.model_used = model
+                    um = getattr(resp, "usage_metadata", None)
+                    usage = {k: getattr(um, k, None) for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count", "total_token_count")} if um else {}
+                    return resp.text or "", usage
+                except Exception as exc:
+                    self.requests.append({"attempt": attempt, "ok": False, "model": model, "error": type(exc).__name__, "seconds": round(time.perf_counter() - t0, 2)})
+                    if not _retryable(exc):
+                        raise
+                    if attempt > retries:
+                        if last:
+                            raise
+                        break  # next model
+                    self.sleep(wait)
+                    wait *= 2
         raise RuntimeError("unreachable")  # pragma: no cover
 
     def close(self) -> None:
@@ -550,6 +560,8 @@ def extract_gemini_edit(d: Path, video_path: Path, cfg: GeminiConfig, transport_
         base["sent"] = True
         text, usage = transport.generate(video_path, SYSTEM, prompt, response_schema(), ranges)
         base["usage"], base["requests"] = usage, getattr(transport, "requests", [])
+        if getattr(transport, "model_used", None):
+            base["model"] = transport.model_used  # the model that actually answered (a fallback when the main one was overloaded)
         try:
             raw = json.loads(text)
         except ValueError as exc:

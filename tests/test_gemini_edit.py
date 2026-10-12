@@ -288,7 +288,7 @@ def test_genai_transport_uploads_waits_retries_and_deletes(monkeypatch, tmp_path
     t = GenaiTransport("key", replace(CFG, max_retries=3), sleep=sleeps.append)
     text, usage = t.generate(tmp_path / "v.mp4", "sys", "prompt", {"type": "object"}, 25.0)
     assert text == '{"ok": 1}' and usage["total_token_count"] == 17 and log["uploads"] == 1 and log["generate"] == 3
-    assert sleeps.count(2.0) >= 2 and 4.0 in sleeps  # waited for ACTIVE, then backed off 2 s, 4 s
+    assert sleeps.count(2.0) >= 1 and 5.0 in sleeps  # waited for ACTIVE, then backed off 5 s before moving on to the next model
     part = log["contents"][0].parts[0]
     assert part.video_metadata.end_offset == "25s" and part.video_metadata.start_offset == "0s" and part.video_metadata.fps == 1.0
     assert log["config"].response_mime_type == "application/json" and log["config"].media_resolution == "MEDIA_RESOLUTION_MEDIUM"
@@ -389,3 +389,11 @@ def test_e2e_gemini_step_is_required_and_gated(tmp_path) -> None:
     logs = []
     code = e2e.run_e2e(tmp_path / "FC002.mp4", tmp_path, run=run, log=logs.append, gemini_allow_remote=True, **base)
     assert code == 1 and not any("build_review" in " ".join(map(str, c)) for c in calls) and not any("continuing without it" in line for line in logs)  # Gemini failing stops the analysis: it is required
+
+
+def test_overloaded_main_model_falls_back_to_the_next_model(monkeypatch, tmp_path) -> None:
+    log = fake_sdk(monkeypatch, fail_times=2, fail_code=503)
+    t = GenaiTransport("key", replace(CFG, max_retries=3, fallback_models=("backup-model",)), sleep=lambda s: None)
+    text, _ = t.generate(tmp_path / "v.mp4", "sys", "prompt", {"type": "object"}, 25.0)
+    assert text == '{"ok": 1}' and log["model"] == "backup-model" and t.model_used == "backup-model"
+    assert [(r["model"], r["ok"]) for r in t.requests] == [(CFG.model, False), (CFG.model, False), ("backup-model", True)]

@@ -237,7 +237,8 @@ class GeminiConfig:
     temperature: float = 0.2
     max_suggestions_per_segment: int = 3
     timeout_s: float = 240.0  # per request; not part of the cache key
-    max_retries: int = 2  # on 429 / 5xx / timeouts; not part of the cache key
+    max_retries: int = 5  # on 429 / 5xx / timeouts (a 503 "high demand" can last a minute or two); not part of the cache key
+    fallback_models: tuple[str, ...] = ("gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash")  # tried in order when the main model stays overloaded (503/429); not in the key
     upload_wait_s: float = 300.0  # max wait for the uploaded file to become ACTIVE; not part of the cache key
     max_upload_mb: float = 100.0  # refuse larger files before sending
     # Cost control for long videos: Gemini is given at most max_analysed_s seconds of frames. A video whose predicted span fits is sent

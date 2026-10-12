@@ -248,3 +248,33 @@ def test_indented_output_lines_are_not_mistaken_for_steps() -> None:
     for line in ("[1/9] features ...", "      [1/1] UPabcd12: ok (visual=available)", "[1/9] features: ok in 7 s"):
         job.add(line)
     assert [(s["n"], s["name"], s["state"]) for s in job.view()["steps"]] == [(1, "features", "ok")]
+
+
+def test_large_uploads_are_shrunk_and_small_ones_left_alone(tmp_path) -> None:
+    import shutil
+    import subprocess
+
+    import pytest
+
+    from hookline.app_server import shrink_for_model
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+
+    def make(name: str, size: str):
+        p = tmp_path / name
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=10:duration=1", "-pix_fmt", "yuv420p", str(p)], check=True)
+        return p
+
+    def dims(p) -> tuple[int, int]:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(p)],
+                             capture_output=True, text=True, check=True).stdout.strip().split(",")
+        return int(out[0]), int(out[1])
+
+    small = make("small.mp4", "320x568")
+    assert shrink_for_model(small) == small
+    big = make("big.mp4", "1080x1920")
+    res = shrink_for_model(big)
+    assert res.is_file() and dims(res) == (720, 1280)
+    wide = make("wide.mp4", "1920x1080")
+    assert dims(shrink_for_model(wide)) == (1280, 720)

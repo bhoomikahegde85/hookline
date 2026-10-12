@@ -277,7 +277,7 @@ def test_page_shows_scores_with_their_accuracy_in_chrome(tmp_path) -> None:
                          capture_output=True, text=True, timeout=120).stdout
     m = re.search(r'<pre id="selftest">(.*?)</pre>', out, re.S)
     assert m and m.group(1).startswith("SELFTEST PASS") and "three score gauges" in m.group(1), m.group(1) if m else "page script did not run"
-    assert "not shown to beat chance" in out and "POPULARITY (TRIBE, experimental)" in out and "needs TTCC on the reference set" in out
+    assert "TRIBE signal" in out and "BRAIN RESPONSE (TRIBE)" in out and "needs TTCC on other videos" in out
     assert "will go viral" not in out.lower().replace("not a statement that a video will or will not go viral", "")
 
 

@@ -231,7 +231,7 @@ def test_no_account_data_and_the_note_says_what_this_is(world) -> None:
     rep = hr.build_hook_report(d, data, feats, ttcc)
     text = json.dumps(rep).lower()
     assert not [w for w in ACCOUNT_WORDS if w in text]
-    assert "reference reels" in rep["note"] and "not validated against audience data" in rep["note"] and "not a viral verdict" in rep["note"]
+    assert "other videos" in rep["note"] and "not validated against audience data" in rep["note"] and "not a viral verdict" in rep["note"]
     assert set(rep) == {"schema", "video_id", "status", "reason", "verdict", "factors", "strengths", "weaknesses", "gemini_hook_assessment", "reference", "note"}
     assert set(rep["factors"][0]) == {"key", "label", "value", "unit", "percentile_vs_reference", "reading", "direction", "why_it_matters", "source"}
 

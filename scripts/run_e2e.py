@@ -96,7 +96,7 @@ def run_e2e(video: Path, root: Path, run=subprocess.run, log=print, wake=None, *
         if step["skip"]:
             log(f"{label}: {step['skip']}")
             results[n] = (step["name"], "skipped")
-            return step["name"].split(" ")[0] in ("retention", "explanation", "popularity")  # TTCC, Gemini and TRIBE are required for a complete analysis
+            return step["name"].split(" ")[0] in ("retention", "explanation")  # TTCC and Gemini are required; TRIBE (popularity) is experimental and optional
         log(f"{label} ...")
         if wake and step["name"].split(" ")[0] in ("retention", "popularity"):
             wake("ttcc" if step["name"].startswith("retention") else "tribe")  # wait until that Space answers (it may have been asleep)
@@ -117,6 +117,10 @@ def run_e2e(video: Path, root: Path, run=subprocess.run, log=print, wake=None, *
             log("      " + ln[:240])
         if proc.returncode != 0:
             log(hint(n, proc.returncode, out))
+            if step["name"].startswith("popularity"):  # experimental (no signal found in the evaluation): never blocks the analysis
+                results[n] = (step["name"], f"unavailable (optional step; exit {proc.returncode})")
+                log("      popularity score unavailable; continuing without it")
+                return False
             return True
         return False
 
@@ -127,7 +131,7 @@ def run_e2e(video: Path, root: Path, run=subprocess.run, log=print, wake=None, *
             break
     results = sorted(results.items())
     results = [r for _, r in results]
-    ok = all(s in ("ok", "skipped") for _, s in results) and len(results) == len(steps)
+    ok = all(s in ("ok", "skipped") or s.startswith("unavailable (optional") for _, s in results) and len(results) == len(steps)
     page = root / "features" / video.stem / "review.html"
     log(f"\nsummary ({time.time() - started:.0f} s): " + "; ".join(f"{name}: {status}" for name, status in results))
     if ok and page.is_file():

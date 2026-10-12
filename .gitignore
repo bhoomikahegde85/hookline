@@ -69,3 +69,6 @@ official_models/
 # Generated reports (hand-written docs in reports/ stay tracked)
 reports/*_report.md
 reports/*_report.json
+
+# Judging-set reels, cookies and metadata: local only
+data/judging/

@@ -1,6 +1,6 @@
 """How strong is a video's hook, and why (``hook_report.json``).
 
-Every factor is a value measured on the video's own first seconds (or a TTCC model prediction), placed among the reference reels
+Every factor is a value measured on the video's own first seconds (or a TTCC model prediction), placed among the other videos
 (the regular reels of the dataset, outliers excluded, the video itself excluded) as a percentile. A fixed, hand-written rule per factor
 (``HOOK_RULES``: lower is better, higher is better, closest to the reference median is best, or no direction) turns the percentile into
 helps / hurts / neutral. The rules are rules of thumb: nothing here is fitted, nothing is validated against audience data, and none of it
@@ -32,7 +32,7 @@ HOOK_RULES: dict[str, dict] = {
     "first_cut_s": {"label": "Time to first visible cut", "unit": "s", "rule": "lower_better", "group": "measured", "event": "cut",
                     "why": RULE_TAG + "a long wait with nothing changing on screen may let attention drift; a single continuous shot is not penalised."},
     "cuts_per_s_0_5": {"label": "Cuts per second", "unit": "cuts/s", "rule": "none", "group": "measured", "event": None,
-                       "why": RULE_TAG + "shown for context, not scored: in the reference reels cuts per second had no measurable relation to outcome (Spearman about 0.0), so neither a fast nor a slow opening is treated as better or worse."},
+                       "why": RULE_TAG + "shown for context, not scored: in the other videos cuts per second had no measurable relation to outcome (Spearman about 0.0), so neither a fast nor a slow opening is treated as better or worse."},
     "motion_mean_0_5": {"label": "Mean motion", "unit": "frame-difference units", "rule": "higher_better", "group": "measured", "event": None,
                         "why": RULE_TAG + "visible movement in the opening may catch the eye more than a still frame."},
     "brightness_mean_0_5": {"label": "Brightness", "unit": "0-255", "rule": "mid_best", "group": "measured", "event": None,
@@ -52,7 +52,7 @@ HOOK_RULES: dict[str, dict] = {
     "ttcc_R10": {"label": "Predicted hold at 10 s", "unit": "fraction", "rule": "higher_better", "group": "ttcc", "event": None,
                  "why": RULE_TAG + "TTCC's predicted share still watching at 10 s; a higher value may mean the hook carries into the body. A model prediction, not measured retention."},
 }
-NOTE = ("This report compares the video with reference reels, using rules of thumb that are not validated against audience data. It is "
+NOTE = ("This report compares the video with other videos, using rules of thumb that are not validated against audience data. It is "
         "not a viral verdict: whether a reel spreads also depends on distribution, timing and trends that are not in the video.")
 
 
@@ -91,7 +91,7 @@ def _reference(data_root: Path, features_root: Path, ttcc_root: Path | None, exc
     if _safe(ve.assemble, rows, features_root, ttcc_root) is not None:
         return rows
     kept = []
-    for r in rows:  # one corrupt artifact in the reference set drops that reel only
+    for r in rows:  # one corrupt artifact in other videos drops that reel only
         if _safe(ve.assemble, [r], features_root, ttcc_root) is not None:
             kept.append(r)
     return kept
@@ -135,10 +135,10 @@ def _factor(key: str, value: float, ref_vals: np.ndarray, win: float, no_event: 
     if no_event:
         reading = f"no {spec['event']} in the first {win:g} s" + (" (single continuous shot)" if key == "first_cut_s" else "") + ": not counted for or against"
     elif p is None:
-        reading = f"{_fmt(value, spec['unit'])}: too few reference reels to compare"
+        reading = f"{_fmt(value, spec['unit'])}: too few other videos to compare"
     else:
         where = f"lower than {100 - p:.0f}% of" if rule == "lower_better" else f"higher than {p:.0f}% of"
-        reading = f"{_fmt(value, spec['unit'])}: {where} the reference reels"
+        reading = f"{_fmt(value, spec['unit'])}: {where} the other videos"
         if rule == "mid_best":
             reading += f" (reference median {_fmt(float(np.median(ref_vals)), spec['unit'])}; nearer the median is treated as better)"
     return {"key": key, "label": spec["label"], "value": round(value, 4), "unit": spec["unit"], "percentile_vs_reference": p, "reading": reading,
@@ -164,7 +164,7 @@ def _verdict(video_dir: Path, factors: list[dict]) -> dict:
     if hp is not None:
         label = "strong" if hp >= STRONG_AT else ("weak" if hp <= WEAK_AT else "average")
         return {"label": label, "percentile": hp,
-                "basis": (f"TTCC's predicted early hold (mean of R3, R5 and, for clips of 10 s or more, R10) is at the {hp:.0f}th percentile of the reference reels. This is a model "
+                "basis": (f"TTCC's predicted early hold (mean of R3, R5 and, for clips of 10 s or more, R10) is at the {hp:.0f}th percentile of the other videos. This is a model "
                           "prediction of retention, unvalidated, and not audience data.")}
     known = [f for f in factors if f["direction"] != "unknown"]
     if len(known) >= MIN_DIRECTIONAL:
@@ -176,7 +176,7 @@ def _verdict(video_dir: Path, factors: list[dict]) -> dict:
                 "basis": (f"{helps} of {len(known)} factors help and {hurts} hurt, from measured opening features only, no TTCC. "
                           "Rule-of-thumb reading, not validated.")}
     return {"label": "not rated", "percentile": None,
-            "basis": f"only {len(known)} factor(s) could be compared with the reference reels (at least {MIN_DIRECTIONAL} are needed) and no TTCC hook score exists"}
+            "basis": f"only {len(known)} factor(s) could be compared with the other videos (at least {MIN_DIRECTIONAL} are needed) and no TTCC hook score exists"}
 
 
 def _empty(video_id: str, reason: str, n: int = 0) -> dict:
@@ -187,7 +187,7 @@ def _empty(video_id: str, reason: str, n: int = 0) -> dict:
 
 def build_hook_report(video_dir: Path, data_root: Path, features_root: Path, ttcc_root: Path | None = None) -> dict:
     """The hook report for the video whose artifacts are in ``video_dir``; never raises. ``data_root`` / ``features_root`` / ``ttcc_root`` describe the
-    reference reels."""
+    other videos."""
     vid = video_dir.name
     measured = _safe(ve.measured_features, video_dir)
     if measured is None:
@@ -227,7 +227,7 @@ def build_hook_report(video_dir: Path, data_root: Path, features_root: Path, ttc
     return {"schema": "hookline.hook_report", "video_id": vid, "status": "ok", "reason": None, "verdict": _verdict(video_dir, factors), "factors": factors,
             "strengths": strengths, "weaknesses": weaknesses, "gemini_hook_assessment": _gemini_text(video_dir),
             "reference": {"n_reels": n, "n_with_ttcc": n_ttcc,
-                          "note": (f"Percentile = share of the reference reels (regular reels of the dataset, outliers and this video excluded) with a lower value; "
+                          "note": (f"Percentile = share of the other videos (regular reels of the dataset, outliers and this video excluded) with a lower value; "
                                    f"TTCC factors are compared with the {n_ttcc} that have a TTCC prediction.")},
             "note": NOTE.format(n=n or "the")}
 
