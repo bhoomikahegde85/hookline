@@ -45,7 +45,7 @@ LICENSE = (
     "research use only: Snapchat UGC from SnapUGC (no license file in original repo; HF mirror tcm03/SnapUGC "
     "self-tagged apache-2.0). Do not redistribute or show publicly."
 )
-MAX_VIDEOS = 50
+MAX_VIDEOS = 200
 TIMEOUT = 60
 
 

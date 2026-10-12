@@ -36,6 +36,7 @@ from typing import Any
 
 import numpy as np
 
+from .brain_networks import HOOK_FEATURES, NETWORKS, network_features
 from .evaluation import TRIBE_FEATURES, spearman
 
 REGULAR_GROUPS = ("face", "faceless")
@@ -46,19 +47,23 @@ MEASURED_FEATURES = ("cuts_per_s_0_5", "first_cut_s", "motion_mean_0_5", "bright
 TTCC_FEATURES = ("ttcc_R3", "ttcc_R5", "ttcc_R10", "ttcc_steepest_early_drop")
 PERSON_FEATURES = ("person_max_0_3s", "talking_to_camera_mean_0_3s")  # SigLIP zero-shot scores over the first 3 s: a person / someone speaking to the camera
 TRIBE_FEATURE_COLS = tuple(f"tribe_{n}" for n in TRIBE_FEATURES)
+TRIBENET_FEATURE_COLS = tuple(f"tribenet_{n}" for n in (*(f"net_{x}" for x in NETWORKS), *HOOK_FEATURES))  # Yeo-7 network profile + attention-curve peak
 TRIBE_WINDOW_S = 10.0  # TRIBE summaries use the first 10 s only, the same opening the hook analysis looks at
 # Feature groups per model. "page_type" is dataset metadata (the folder the reel came from); the rest are computed from the video.
 MODEL_GROUPS: dict[str, tuple[str, ...]] = {
     "constant": (), "follower_band": ("band",), "duration": ("duration",), "page_type": ("page_type",), "measured": ("measured",),
     "measured_plus_page_type": ("measured", "page_type"), "person_only": ("person",), "measured_plus_person": ("measured", "person"), "ttcc_only": ("ttcc",), "measured_plus_ttcc": ("measured", "ttcc"),
-    "tribe_only": ("tribe",), "ttcc_plus_tribe": ("ttcc", "tribe"), "measured_plus_ttcc_plus_tribe": ("measured", "ttcc", "tribe")}
+    "tribe_only": ("tribe",), "ttcc_plus_tribe": ("ttcc", "tribe"), "measured_plus_ttcc_plus_tribe": ("measured", "ttcc", "tribe"),
+    "tribenet_only": ("tribenet",), "measured_plus_tribenet": ("measured", "tribenet"), "page_type_plus_tribenet": ("page_type", "tribenet")}
 MODELS = tuple(MODEL_GROUPS)
-SUBSET_GROUPS = ("ttcc", "tribe")  # groups that only some reels have: such a model runs on the reels that have all of them
+SUBSET_GROUPS = ("ttcc", "tribe", "tribenet")  # groups that only some reels have: such a model runs on the reels that have all of them
 # (bigger model, smaller model): the paired bootstrap difference tells whether the extra feature group adds anything
 PAIRS = (("measured", "constant"), ("measured", "duration"), ("measured", "follower_band"), ("measured", "page_type"), ("duration", "constant"),
          ("page_type", "constant"), ("measured_plus_page_type", "measured"), ("person_only", "constant"), ("measured_plus_person", "measured"), ("measured_plus_ttcc", "measured"), ("ttcc_only", "constant"),
          ("tribe_only", "constant"), ("ttcc_plus_tribe", "ttcc_only"), ("ttcc_plus_tribe", "tribe_only"),
-         ("measured_plus_ttcc_plus_tribe", "measured_plus_ttcc"))
+         ("measured_plus_ttcc_plus_tribe", "measured_plus_ttcc"),
+         ("tribenet_only", "constant"), ("tribenet_only", "tribe_only"), ("measured_plus_tribenet", "measured"),
+         ("page_type_plus_tribenet", "page_type"), ("tribenet_only", "page_type"))
 DEFAULTS = {"seed": 0, "folds": 5, "repeats": 20, "alpha": 10.0, "n_boot": 2000, "n_perm": 1000}
 MIN_TTCC_VIDEOS = 30  # also the minimum for any model that needs TRIBE
 VERIFIED_NOTE = ("Verified: the metrics in this file were computed by this run on real Instagram views of these reels (held-out, grouped by "
@@ -182,9 +187,25 @@ def tribe_features(d: Path) -> tuple[dict | None, dict | None]:
     return dict(zip(TRIBE_FEATURE_COLS, vals)), {"segments_used": int(keep.sum())}
 
 
+def tribenet_features(d: Path) -> tuple[dict | None, dict | None]:
+    """Yeo-7 network profile and attention-curve peak of TRIBE's predicted response over the first 10 s (``brain_networks``); (None, why) when absent."""
+    tj, npy = d / "tribe.json", d / "tribe_preds.npy"
+    if not (tj.is_file() and npy.is_file()):
+        return None, {"reason": "no TRIBE output"}
+    t = json.loads(tj.read_text())
+    if not t.get("measured"):
+        return None, {"reason": "TRIBE output not measured"}
+    f = network_features(np.load(npy), t["timestamps_s"], TRIBE_WINDOW_S)
+    if f is None:
+        return None, {"reason": "fewer than 4 TRIBE segments in the first 10 s"}
+    if not all(math.isfinite(v) for v in f.values()):
+        return None, {"reason": "network features have missing values"}
+    return {f"tribenet_{k}": v for k, v in f.items()}, {}
+
+
 def assemble(rows: list[dict], features_root: Path, ttcc_root: Path | None, tribe_root: Path | None = None) -> dict:
     """Attach features. Returns coverage facts; nothing is invented for a missing file (the row is marked and imputed in-fold, or excluded)."""
-    cov = {"measured_missing": [], "ttcc_available": [], "ttcc_missing": {}, "ttcc_configs": {}, "tribe_available": [], "tribe_missing": {}}
+    cov = {"measured_missing": [], "ttcc_available": [], "ttcc_missing": {}, "ttcc_configs": {}, "tribe_available": [], "tribe_missing": {}, "tribenet_available": []}
     for r in rows:
         d = features_root / r["video_id"]
         try:
@@ -193,7 +214,7 @@ def assemble(rows: list[dict], features_root: Path, ttcc_root: Path | None, trib
             r["measured"], r["duration_s"] = {k: float("nan") for k in MEASURED_FEATURES}, float("nan")
             cov["measured_missing"].append(f"{r['video_id']}: {type(exc).__name__}")
         r["person"] = person_features(d)
-        r["ttcc"] = r["tribe"] = None
+        r["ttcc"] = r["tribe"] = r["tribenet"] = None
         if ttcc_root is not None:
             f, info = ttcc_features(ttcc_root / r["video_id"])
             if f is None:
@@ -210,6 +231,10 @@ def assemble(rows: list[dict], features_root: Path, ttcc_root: Path | None, trib
             else:
                 r["tribe"] = f
                 cov["tribe_available"].append(r["video_id"])
+            nf, _ = tribenet_features(tribe_root / r["video_id"])
+            if nf is not None:
+                r["tribenet"] = nf
+                cov["tribenet_available"].append(r["video_id"])
     return cov
 
 
@@ -232,6 +257,8 @@ def design(rows: list[dict], model: str) -> np.ndarray:
             cols.append(np.array([[(r.get("person") or {}).get(k, float("nan")) for k in PERSON_FEATURES] for r in rows]))
         elif g == "tribe":
             cols.append(np.array([[(r.get("tribe") or {}).get(k, float("nan")) for k in TRIBE_FEATURE_COLS] for r in rows]))
+        elif g == "tribenet":
+            cols.append(np.array([[(r.get("tribenet") or {}).get(k, float("nan")) for k in TRIBENET_FEATURE_COLS] for r in rows]))
     return np.hstack(cols) if cols else np.zeros((n, 0))
 
 
@@ -544,7 +571,7 @@ def write_outputs(run_dir: Path, rows: list[dict], medians: dict, coverage: dict
 
     with (run_dir / "prediction_results.csv").open("w", newline="") as f:
         cols = ["video_id", "handle", "follower_band", "page_type", "views", "overperformance", "above_band_median", *[f"oof_{m}" for m in results["scores"]],
-                *MEASURED_FEATURES, *PERSON_FEATURES, *TTCC_FEATURES, *TRIBE_FEATURE_COLS, "duration_s"]
+                *MEASURED_FEATURES, *PERSON_FEATURES, *TTCC_FEATURES, *TRIBE_FEATURE_COLS, *TRIBENET_FEATURE_COLS, "duration_s"]
         w = csv.writer(f)
         w.writerow(cols)
         for i, r in enumerate(regular):
@@ -552,8 +579,9 @@ def write_outputs(run_dir: Path, rows: list[dict], medians: dict, coverage: dict
             feats = [("" if math.isnan(r["measured"][k]) else round(r["measured"][k], 6)) for k in MEASURED_FEATURES]
             tt = [("" if not r["ttcc"] or math.isnan(r["ttcc"][k]) else round(r["ttcc"][k], 6)) for k in TTCC_FEATURES]
             tb = [("" if not r.get("tribe") else round(r["tribe"][k], 6)) for k in TRIBE_FEATURE_COLS]
+            tn = [("" if not r.get("tribenet") else round(r["tribenet"][k], 6)) for k in TRIBENET_FEATURE_COLS]
             pr = [("" if not r.get("person") else round(r["person"][k], 6)) for k in PERSON_FEATURES]
-            w.writerow([r["video_id"], r["handle"], r["band"], r.get("page_type", ""), r["views"], round(r["overperformance"], 6), r["above_band_median"], *sc, *feats, *pr, *tt, *tb,
+            w.writerow([r["video_id"], r["handle"], r["band"], r.get("page_type", ""), r["views"], round(r["overperformance"], 6), r["above_band_median"], *sc, *feats, *pr, *tt, *tb, *tn,
                         "" if math.isnan(r["duration_s"]) else round(r["duration_s"], 3)])
     paths["prediction_results"] = "prediction_results.csv"
 
@@ -589,7 +617,7 @@ def write_outputs(run_dir: Path, rows: list[dict], medians: dict, coverage: dict
                "outliers": {"per_model": results["outliers"]["per_model"], "note": results["outliers"]["note"]},
                "coverage": {"measured_missing": coverage["measured_missing"], "ttcc_available": len(coverage["ttcc_available"]),
                             "ttcc_missing": len(coverage["ttcc_missing"]), "ttcc_configs": coverage["ttcc_configs"],
-                            "tribe_available": len(coverage["tribe_available"]), "tribe_missing": len(coverage["tribe_missing"])},
+                            "tribe_available": len(coverage["tribe_available"]), "tribenet_available": len(coverage["tribenet_available"]), "tribe_missing": len(coverage["tribe_missing"])},
                "files": paths}
     (run_dir / "metrics_summary.json").write_text(json.dumps(_jsonable(summary), indent=2))
     paths["metrics_summary"] = "metrics_summary.json"

@@ -10,7 +10,7 @@ Full TRIBE coverage (run `20261011T031947Z`, 99 regular reels with TRIBE output;
 | measured_plus_ttcc (100 reels) | 100 | 0.617 | [0.491, 0.715] | 0.036 |
 
 TRIBE shows no signal for beating a page's usual views and adds nothing to TTCC or the measured features. It is kept only as a separate, labelled
-experimental popularity score (never combined with TTCC); the page shows "no signal found" with its AUC beside the number. An earlier 39-reel run (0.54) was too small to mean anything.
+brain-response view (never combined with TTCC); the page describes the verdict without leading with the AUC. An earlier 39-reel run (0.54) was too small to mean anything.
 
 Other checks, same 100 regular reels:
 - Predicted hold (mean of R3, R5, R10) in quartiles: bottom quarter beat their page median 40%, middle half 58%, top quarter 44% (all reels 50%). Not monotone.

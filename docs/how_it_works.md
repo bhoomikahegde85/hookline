@@ -18,8 +18,8 @@ video (upload page, http://127.0.0.1:8770, or scripts/run_e2e.py)
   |-- 3. Gemini (required): reads the flagged clips together with the transcript, OCR, audio and TTCC evidence and returns timestamped, evidence-cited
   |      observations and edit suggestions, validated strictly (invented ids, out-of-range timestamps and unsupported claims are dropped)
   |-- 4. Music vs voice (Demucs htdemucs, local): music and voice levels over the first 5 s; descriptive only
-  |-- 5. TRIBE v2 (separate model, on our Space): predicted brain response over the first 10 s, used ONLY for a separate experimental popularity score;
-  |      never combined with TTCC
+  |-- 5. TRIBE v2 (separate model, on our Space): predicted brain response over time, shown as exploratory network curves, dominant-network
+  |      profiles and hook/surprise peaks; never combined with TTCC
   |-- 6. Reference set: 100 real reels with real views; the video is placed among them (percentiles), never scored on account data
   |-- Segments: the predicted span is split evenly by duration (about 4 s each, at most 12 segments), each typed from its own predicted fall
   v
@@ -54,9 +54,8 @@ Evidence, all reproducible under `01-Hookline/evaluation/` (see its README):
    Caveat: curves are close to one shared decay (99% of the between-reel difference is one scale factor; 3 s hold median 19%, 10th to 90th percentile 15% to 23%; an all-black video gets 17%),
    so the page plots each curve against the reference band and the all-black baseline.
 2. **Views-based evaluation** on 100 real reels (label: log views relative to the follower band's median; grouped cross-validation by creator; AUC, Spearman, bootstrap
-   intervals, permutation tests). Result (details in `docs/evaluation.md`): measured opening features AUC 0.60 [0.46, 0.68]; TTCC hook values alone 0.53 [0.41, 0.63]; both together 0.62 [0.49, 0.72] (permutation p = 0.036 but no demonstrated gain over measured alone);
-   the predicted early hold has the expected sign (rho +0.13) but is not significant. So **no content-only model is shown to predict beating a page's usual views**, and the page says so next to the score. The 10 extreme viral reels are scored separately by models that never saw their creator.
-   **TRIBE v2 popularity score (separate, experimental), 99 reels with TRIBE output:** AUC 0.46 [0.34, 0.52]: no signal found. TTCC plus TRIBE 0.49; measured plus TTCC plus TRIBE 0.58 (no gain over 0.62 without TRIBE).
+   intervals, permutation tests). Result (details in `docs/evaluation.md`): the content-only models are **not shown to predict beating a page's usual views**, so the page presents hook/drop diagnostics instead of a viral verdict. The 10 extreme viral reels are scored separately by models that never saw their creator.
+   **TRIBE v2:** kept as a predicted brain-response timeline and network view. Its summaries did not add validated views signal, so Hookline does not use them as a popularity or retention claim.
    **Hook verdict vs views:** reels in the bottom quarter of predicted hold beat their page's median views 40% of the time, the middle half 58%, the top quarter 44%: the verdict describes the predicted curve and is not a grade.
    **Music and voice (Demucs, exploratory):** voice loudness vs over-performance rho +0.26 (p=0.01, about 0.04 after correcting for four tests), music loudness -0.16 (p=0.12); not used in any score.
 3. **No retention or watch-time labels exist**, so we never use views as retention. Views are used only to ask "does the video's own content predict beating its page's usual reach?".
@@ -77,7 +76,7 @@ GPU out-of-memory (the runner shrinks the window), Space not reachable (clear er
 ## Where we would take it with more time and data
 - Collect reels with known outcomes (the brief says this is part of the task) using the provided Instagram scrapers: watch time and retention curves would let us fit and validate
   the hook and drop predictions directly, and fine-tune TTCC on this domain.
-- Feed audio to the retention model (TTCC was trained with audio off). TRIBE v2 was evaluated on 99 reels and showed no signal for views; real retention curves are the missing label.
+- Feed audio to the retention model (TTCC was trained with audio off). TRIBE v2 gives a richer predicted brain-response timeline, but real retention curves are the missing label.
 - Trending-sound detection needs platform data (trend lists, sound usage counts) that we do not have; Gemini only describes the audio and whether it fits the picture, as an unvalidated hypothesis.
 - Calibrate the hook rules from outcome data instead of rules of thumb; A/B-test suggested edits.
 - Per-niche reference sets (meme, quote, creator) instead of one pool.
